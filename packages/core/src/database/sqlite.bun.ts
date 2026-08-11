@@ -13,6 +13,11 @@ const ATTR_DB_SYSTEM_NAME = "db.system.name"
 const TypeId = "~@opencode-ai/core/database/SqliteBun" as const
 type TypeId = typeof TypeId
 
+export const supportsTuningPragmas = true
+
+// Foreign keys default OFF and can be toggled per connection.
+export const supportsForeignKeyToggle = true
+
 interface SqliteClient extends SqlClient.SqlClient {
   readonly [TypeId]: TypeId
   readonly config: Config
