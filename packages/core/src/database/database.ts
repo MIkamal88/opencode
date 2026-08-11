@@ -3,6 +3,7 @@ export * as Database from "./database"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { sqliteLayer, supportsForeignKeyToggle, supportsTuningPragmas } from "#sqlite"
 import { Context, Effect, Layer, Schema } from "effect"
+import type { SqlClient } from "effect/unstable/sql"
 import { Global } from "@opencode-ai/util/global"
 import { isAbsolute, join } from "path"
 import { DatabaseMigration } from "./migration"
@@ -46,12 +47,17 @@ export function layer(options: Options = { path: ":memory:" }) {
   return Layer.unwrap(
     Effect.gen(function* () {
       const global = yield* Global.Service
-      const provide = (filename: string) => databaseLayer.pipe(Layer.provide(sqliteLayer({ filename })))
       const filename = options.path ?? ":memory:"
-      if (filename === ":memory:" || isAbsolute(filename)) return provide(filename)
-      return provide(join(global.data, filename))
+      if (filename === ":memory:" || isAbsolute(filename)) return layerWith(sqliteLayer({ filename }))
+      return layerWith(sqliteLayer({ filename: join(global.data, filename) }))
     }),
   )
+}
+
+// Builds the database service over an already-configured SqlClient layer for
+// runtimes that receive database storage instead of opening a filesystem path.
+export function layerWith(sqlite: Layer.Layer<SqlClient.SqlClient>) {
+  return databaseLayer.pipe(Layer.provide(sqlite))
 }
 
 export function configured(options?: Options) {
