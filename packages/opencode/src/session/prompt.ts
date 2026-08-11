@@ -1276,6 +1276,8 @@ const layer = Layer.effect(
               sessionID,
               parentSessionID: session.parentID,
               system,
+              history: msgs,
+              suffix: isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : undefined,
               messages: [
                 ...modelMsgs,
                 ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),

@@ -35,6 +35,7 @@ import { isMedia } from "@/util/media"
 import type { SystemError } from "bun"
 import type { Provider } from "@/provider/provider"
 import { Effect, Schema } from "effect"
+import { PiAIProviderError } from "./llm/pi-ai-events"
 
 /** Error shape thrown by Bun's fetch() when gzip/br decompression fails mid-stream */
 interface FetchDecompressionError extends Error {
@@ -676,6 +677,26 @@ export function fromError(
         },
         { cause: e },
       ).toObject()
+    case e instanceof PiAIProviderError: {
+      const message = e.response.errorMessage ?? e.message
+      if (/context (length|window)|too many tokens|prompt is too long/i.test(message)) {
+        return new ContextOverflowError({ message }, { cause: e }).toObject()
+      }
+      return new APIError(
+        {
+          message,
+          isRetryable: e.retryable,
+          metadata: {
+            provider: e.response.provider,
+            api: e.response.api,
+            model: e.response.model,
+            ...(e.response.rawStopReason ? { rawStopReason: e.response.rawStopReason } : {}),
+            ...(e.response.diagnostics ? { diagnostics: JSON.stringify(e.response.diagnostics) } : {}),
+          },
+        },
+        { cause: e },
+      ).toObject()
+    }
     case APICallError.isInstance(e):
       const parsed = ProviderError.parseAPICallError({
         providerID: ctx.providerID,

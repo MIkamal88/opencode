@@ -76,6 +76,7 @@
     "@ai-sdk/xai": "3.0.102",
     "@aws-sdk/credential-providers": "3.1057.0",
     "@clack/prompts": "1.0.0-alpha.1",
+    "@earendil-works/pi-ai": "0.84.1",
     "@effect/opentelemetry": "catalog:",
     "@effect/platform-node": "catalog:",
     "@ff-labs/fff-bun": "0.9.4",

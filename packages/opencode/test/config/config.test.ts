@@ -1349,6 +1349,19 @@ test("config parser preserves permission order while ignoring unknown top-level 
   expect(config).not.toHaveProperty("plugins")
 })
 
+test("config parser accepts the pi-ai runtime gate and provider allowlist", () => {
+  expect(ConfigParse.schema(ConfigV1.Info, { experimental: { pi_ai: true } }, "test:config").experimental?.pi_ai).toBe(
+    true,
+  )
+  expect(
+    ConfigParse.schema(
+      ConfigV1.Info,
+      { experimental: { pi_ai: { providers: ["anthropic", "openai", "opencode-go"] } } },
+      "test:config",
+    ).experimental?.pi_ai,
+  ).toEqual({ providers: ["anthropic", "openai", "opencode-go"] })
+})
+
 // MCP config merging tests
 
 it.instance("project config can override MCP server enabled status", () =>

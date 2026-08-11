@@ -182,6 +182,16 @@ export const Info = Schema.Struct({
       mcp_timeout: Schema.optional(PositiveInt).annotate({
         description: "Timeout in milliseconds for model context protocol (MCP) requests",
       }),
+      pi_ai: Schema.optional(
+        Schema.Union([
+          Schema.Boolean,
+          Schema.Struct({
+            providers: Schema.optional(Schema.mutable(Schema.Array(Schema.String))),
+          }),
+        ]),
+      ).annotate({
+        description: "Enable the pi-ai runtime for all supported providers or an explicit provider allowlist",
+      }),
       policies: Schema.optional(Schema.mutable(Schema.Array(ConfigExperimental.Policy))).annotate({
         description: "Policy statements applied to supported resources, such as provider access",
       }),

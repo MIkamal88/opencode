@@ -29,6 +29,8 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import { PiAIModels } from "./llm/pi-ai-models"
+import { PiAIRuntime } from "./llm/pi-ai-runtime"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
@@ -41,6 +43,8 @@ export type StreamInput = {
   permission?: PermissionV1.Ruleset
   system: string[]
   messages: ModelMessage[]
+  history?: SessionV1.WithParts[]
+  suffix?: ModelMessage[]
   small?: boolean
   tools: Record<string, Tool>
   retries?: number
@@ -70,6 +74,7 @@ const live: Layer.Layer<
   | EventV2Bridge.Service
   | LLMClientService
   | RuntimeFlags.Service
+  | PiAIModels.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -81,6 +86,7 @@ const live: Layer.Layer<
     const events = yield* EventV2Bridge.Service
     const llmClient = yield* LLMClient.Service
     const flags = yield* RuntimeFlags.Service
+    const piModels = yield* PiAIModels.Service
 
     const run = Effect.fn("LLM.run")(function* (input: StreamRequest) {
       yield* Effect.logInfo("stream", {
@@ -92,16 +98,30 @@ const live: Layer.Layer<
         mode: input.agent.mode,
       })
 
-      const [language, cfg, item, info] = yield* Effect.all(
+      const [cfg, item, info, runtime] = yield* Effect.all(
         [
-          provider.getLanguage(input.model),
           config.get(),
           provider.getProvider(input.model.providerID),
           auth.get(input.model.providerID),
+          provider.resolveRuntime(input.model),
         ],
         { concurrency: "unbounded" },
       )
 
+      const pi = yield* piModels.resolve({
+        gate: cfg.experimental?.pi_ai,
+        model: input.model,
+        provider: item,
+        auth: info,
+        runtime,
+      })
+      const nativeStatus = flags.experimentalNativeLlm
+        ? LLMNativeRuntime.status({ model: input.model, provider: item, auth: info })
+        : { type: "unsupported" as const, reason: "native runtime is disabled" }
+      const language =
+        pi.type === "unsupported" && nativeStatus.type === "unsupported"
+          ? yield* provider.getLanguage(input.model)
+          : undefined
       const isWorkflow = language instanceof GitLabWorkflowLanguageModel
       const prepared = yield* LLMRequestPrep.prepare({
         ...input,
@@ -221,6 +241,47 @@ const live: Layer.Layer<
           })
         : undefined
 
+      if (pi.type === "supported") {
+        const selected = yield* PiAIRuntime.stream({
+          resolved: pi,
+          runtime,
+          system: prepared.system,
+          history: input.history,
+          suffix: input.suffix,
+          messages: prepared.messages,
+          tools: prepared.tools,
+          toolChoice: input.toolChoice,
+          temperature: prepared.params.temperature,
+          topP: prepared.params.topP,
+          topK: prepared.params.topK,
+          maxOutputTokens: prepared.params.maxOutputTokens,
+          providerOptions: prepared.params.options,
+          headers: prepared.headers,
+          sessionID: input.sessionID,
+          retries: input.retries,
+          abort: input.abort,
+        })
+        if (selected.type === "supported") {
+          yield* Effect.logInfo("llm runtime selected", {
+            "llm.runtime": "pi-ai",
+            "llm.provider": input.model.providerID,
+            "llm.model": input.model.id,
+            "llm.pi_provider": pi.model.provider,
+            "llm.pi_api": pi.model.api,
+          })
+          return {
+            type: "pi-ai" as const,
+            stream: selected.stream,
+          }
+        }
+        yield* Effect.logInfo("pi-ai runtime unavailable; falling back", {
+          providerID: input.model.providerID,
+          modelID: input.model.id,
+          "session.id": input.sessionID,
+          reason: selected.reason,
+        })
+      }
+
       // Runtime seam: native is an opt-in adapter over @opencode-ai/llm. It
       // either returns a ready LLMEvent stream or a concrete fallback reason.
       if (flags.experimentalNativeLlm) {
@@ -275,6 +336,7 @@ const live: Layer.Layer<
       })
       // Default runtime path: AI SDK owns provider execution and tool dispatch;
       // LLMAISDK.toLLMEvents below normalizes fullStream parts for the processor.
+      const aiLanguage = language ?? (yield* provider.getLanguage(input.model))
       return {
         type: "ai-sdk" as const,
         result: streamText({
@@ -323,7 +385,7 @@ const live: Layer.Layer<
           maxRetries: input.retries ?? 0,
           messages: prepared.messages,
           model: wrapLanguageModel({
-            model: language,
+            model: aiLanguage,
             middleware: [
               {
                 specificationVersion: "v3" as const,
@@ -365,7 +427,7 @@ const live: Layer.Layer<
 
             const result = yield* run({ ...input, abort: ctrl.signal })
 
-            if (result.type === "native") return result.stream
+            if (result.type === "native" || result.type === "pi-ai") return result.stream
 
             // Adapter seam: both runtimes expose the same LLMEvent stream. Native
             // already returns one; AI SDK streams are converted here.
@@ -398,6 +460,7 @@ export const node = LayerNode.make({
     EventV2Bridge.node,
     llmClient,
     RuntimeFlags.node,
+    PiAIModels.node,
   ],
 })
 

@@ -1154,6 +1154,7 @@ export interface Interface {
   readonly list: () => Effect.Effect<Record<ProviderV2.ID, Info>>
   readonly getProvider: (providerID: ProviderV2.ID) => Effect.Effect<Info>
   readonly getModel: (providerID: ProviderV2.ID, modelID: ModelV2.ID) => Effect.Effect<Model, ModelNotFoundError>
+  readonly resolveRuntime: (model: Model) => Effect.Effect<RuntimeInfo>
   readonly getLanguage: (model: Model) => Effect.Effect<LanguageModelV3, ModelNotFoundError>
   readonly closest: (
     providerID: ProviderV2.ID,
@@ -1161,6 +1162,14 @@ export interface Interface {
   ) => Effect.Effect<{ providerID: ProviderV2.ID; modelID: string } | undefined>
   readonly getSmallModel: (providerID: ProviderV2.ID) => Effect.Effect<Model | undefined>
   readonly defaultModel: () => Effect.Effect<{ providerID: ProviderV2.ID; modelID: ModelV2.ID }, DefaultModelError>
+}
+
+export type RuntimeInfo = {
+  readonly baseURL?: string
+  readonly apiKey?: string
+  readonly headers?: Record<string, string>
+  readonly fetch?: typeof globalThis.fetch
+  readonly options: Record<string, any>
 }
 
 interface State {
@@ -1670,59 +1679,72 @@ const layer = Layer.effect(
 
     const list = Effect.fn("Provider.list")(() => InstanceState.use(state, (s) => s.providers))
 
+    function resolveRuntimeInfo(model: Model, s: State, envs: Record<string, string | undefined>): RuntimeInfo {
+      const provider = s.providers[model.providerID]
+      const options = { ...provider.options }
+
+      if (
+        model.providerID === "google-vertex" &&
+        model.api.npm === "@ai-sdk/google-vertex/anthropic" &&
+        !options.baseURL
+      ) {
+        const baseURL = googleVertexAnthropicBaseURL(
+          typeof options.project === "string" ? options.project : undefined,
+          typeof options.location === "string" ? options.location : undefined,
+        )
+        if (baseURL) options.baseURL = baseURL
+      }
+
+      if (model.providerID === "google-vertex" && !model.api.npm.includes("@ai-sdk/openai-compatible")) {
+        delete options.fetch
+      }
+
+      if (model.api.npm.includes("@ai-sdk/openai-compatible") && options["includeUsage"] !== false) {
+        options["includeUsage"] = true
+      }
+
+      const baseURL = iife(() => {
+        let url =
+          typeof options["baseURL"] === "string" && options["baseURL"] !== "" ? options["baseURL"] : model.api.url
+        if (!url) return
+
+        const loader = s.varsLoaders[model.providerID]
+        if (loader) {
+          const vars = loader(options)
+          for (const [key, value] of Object.entries(vars)) {
+            url = url.replaceAll("${" + key + "}", value)
+          }
+        }
+
+        return url.replace(/\$\{([^}]+)\}/g, (item, key) => envs[String(key)] ?? item)
+      })
+
+      if (baseURL !== undefined) options["baseURL"] = baseURL
+      if (options["apiKey"] === undefined && provider.key) options["apiKey"] = provider.key
+      if (model.headers)
+        options["headers"] = {
+          ...options["headers"],
+          ...model.headers,
+        }
+
+      const headers = isRecord(options.headers)
+        ? Object.fromEntries(
+            Object.entries(options.headers).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+          )
+        : undefined
+
+      return {
+        baseURL,
+        apiKey: typeof options.apiKey === "string" ? options.apiKey : undefined,
+        headers,
+        fetch: typeof options.fetch === "function" ? (options.fetch as typeof globalThis.fetch) : undefined,
+        options,
+      }
+    }
+
     async function resolveSDK(model: Model, s: State, envs: Record<string, string | undefined>) {
       try {
-        const provider = s.providers[model.providerID]
-        const options = { ...provider.options }
-
-        if (
-          model.providerID === "google-vertex" &&
-          model.api.npm === "@ai-sdk/google-vertex/anthropic" &&
-          !options.baseURL
-        ) {
-          const baseURL = googleVertexAnthropicBaseURL(
-            typeof options.project === "string" ? options.project : undefined,
-            typeof options.location === "string" ? options.location : undefined,
-          )
-          if (baseURL) options.baseURL = baseURL
-        }
-
-        if (model.providerID === "google-vertex" && !model.api.npm.includes("@ai-sdk/openai-compatible")) {
-          delete options.fetch
-        }
-
-        if (model.api.npm.includes("@ai-sdk/openai-compatible") && options["includeUsage"] !== false) {
-          options["includeUsage"] = true
-        }
-
-        const baseURL = iife(() => {
-          let url =
-            typeof options["baseURL"] === "string" && options["baseURL"] !== "" ? options["baseURL"] : model.api.url
-          if (!url) return
-
-          const loader = s.varsLoaders[model.providerID]
-          if (loader) {
-            const vars = loader(options)
-            for (const [key, value] of Object.entries(vars)) {
-              const field = "${" + key + "}"
-              url = url.replaceAll(field, value)
-            }
-          }
-
-          url = url.replace(/\$\{([^}]+)\}/g, (item, key) => {
-            const val = envs[String(key)]
-            return val ?? item
-          })
-          return url
-        })
-
-        if (baseURL !== undefined) options["baseURL"] = baseURL
-        if (options["apiKey"] === undefined && provider.key) options["apiKey"] = provider.key
-        if (model.headers)
-          options["headers"] = {
-            ...options["headers"],
-            ...model.headers,
-          }
+        const options = { ...resolveRuntimeInfo(model, s, envs).options }
 
         const key = Hash.fast(
           JSON.stringify({
@@ -1807,6 +1829,10 @@ const layer = Layer.effect(
     const getProvider = Effect.fn("Provider.getProvider")((providerID: ProviderV2.ID) =>
       InstanceState.use(state, (s) => s.providers[providerID]),
     )
+
+    const resolveRuntime = Effect.fn("Provider.resolveRuntime")(function* (model: Model) {
+      return resolveRuntimeInfo(model, yield* InstanceState.get(state), yield* env.all())
+    })
 
     const getModel = Effect.fn("Provider.getModel")(function* (providerID: ProviderV2.ID, modelID: ModelV2.ID) {
       const s = yield* InstanceState.get(state)
@@ -1979,7 +2005,16 @@ const layer = Layer.effect(
       }
     })
 
-    return Service.of({ list, getProvider, getModel, getLanguage, closest, getSmallModel, defaultModel })
+    return Service.of({
+      list,
+      getProvider,
+      getModel,
+      resolveRuntime,
+      getLanguage,
+      closest,
+      getSmallModel,
+      defaultModel,
+    })
   }),
 )
 

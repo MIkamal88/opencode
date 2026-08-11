@@ -31,6 +31,7 @@ import { SessionSummary } from "@/session/summary"
 import { SessionPrompt } from "@/session/prompt"
 import { Instruction } from "@/session/instruction"
 import { LLM } from "@/session/llm"
+import { PiAIModels } from "@/session/llm/pi-ai-models"
 import { LSP } from "@/lsp/lsp"
 import { MCP } from "@/mcp"
 import { McpAuth } from "@/mcp/auth"
@@ -89,6 +90,7 @@ export const AppLayer = AppNodeBuilderV1.build(
     SessionSummary.node,
     SessionPrompt.node,
     Instruction.node,
+    PiAIModels.node,
     LLM.node,
     LSP.node,
     MCP.node,

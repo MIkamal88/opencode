@@ -752,6 +752,90 @@ function createEventResponse(chunks: unknown[], includeDone = false) {
 }
 
 describe("session.llm.stream", () => {
+  it.instance(
+    "streams a custom provider through pi-ai without constructing its AI SDK language model",
+    () =>
+      Effect.gen(function* () {
+        const request = waitRequest(
+          "/chat/completions",
+          createEventResponse(
+            [
+              {
+                id: "chatcmpl-pi",
+                object: "chat.completion.chunk",
+                model: "upstream-pi-local",
+                choices: [{ index: 0, delta: { role: "assistant", content: "Hello pi" }, finish_reason: null }],
+              },
+              {
+                id: "chatcmpl-pi",
+                object: "chat.completion.chunk",
+                model: "upstream-pi-local",
+                choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                usage: { prompt_tokens: 2, completion_tokens: 2, total_tokens: 4 },
+              },
+            ],
+            true,
+          ),
+        )
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.make("pi-local"), ModelV2.ID.make("pi-local-model"))
+        const sessionID = SessionID.make("session-test-pi-local")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+
+        yield* drain({
+          user: {
+            id: MessageID.make("msg_user-pi-local"),
+            sessionID,
+            role: "user",
+            time: { created: Date.now() },
+            agent: agent.name,
+            model: { providerID: ProviderV2.ID.make("pi-local"), modelID: resolved.id },
+          },
+          sessionID,
+          model: resolved,
+          agent,
+          system: ["You are a helpful assistant."],
+          messages: [{ role: "user", content: "Hello" }],
+          tools: {},
+        })
+
+        const capture = yield* Effect.promise(() => request)
+        expect(capture.body.model).toBe("upstream-pi-local")
+        expect(capture.headers.get("authorization")).toBe("Bearer test-pi-key")
+        expect(JSON.stringify(capture.body.messages)).toContain("You are a helpful assistant.")
+      }),
+    {
+      config: () => {
+        const fixture = loadFixture("vivgrid", "gemini-3.1-pro-preview").model
+        return {
+          enabled_providers: ["pi-local"],
+          experimental: { pi_ai: { providers: ["pi-local"] } },
+          provider: {
+            "pi-local": {
+              name: "Pi Local",
+              env: ["PI_LOCAL_API_KEY"],
+              npm: "@invalid/pi-only-provider",
+              api: `${state.server!.url.origin}/v1`,
+              models: {
+                "pi-local-model": {
+                  ...configModel(fixture),
+                  id: "upstream-pi-local",
+                  name: "Pi Local Model",
+                  options: { pi_ai: { api: "openai-completions" } },
+                } as ConfigModel,
+              },
+              options: { apiKey: "test-pi-key", baseURL: `${state.server!.url.origin}/v1` },
+            },
+          },
+        }
+      },
+    },
+  )
+
   const vivgridFixture = { providerID: "vivgrid", modelID: "gemini-3.1-pro-preview" }
   it.instance(
     "sends temperature, tokens, and reasoning options for openai-compatible models",

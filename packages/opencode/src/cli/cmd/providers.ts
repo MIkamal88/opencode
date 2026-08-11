@@ -17,6 +17,10 @@ import { Process } from "@/util/process"
 import { errorMessage } from "@/util/error"
 import { text } from "node:stream/consumers"
 import { Effect, Option } from "effect"
+import type { AuthEvent, AuthPrompt, Models } from "@earendil-works/pi-ai"
+import { EffectBridge } from "@/effect/bridge"
+import { PiAIAuth } from "@/session/llm/pi-ai-auth"
+import { PiAIModels } from "@/session/llm/pi-ai-models"
 
 type PluginAuth = NonNullable<Hooks["auth"]>
 
@@ -35,6 +39,140 @@ const cliTry = <Value>(message: string, fn: () => PromiseLike<Value>) =>
     try: fn,
     catch: (error) => new CliError({ message: message + errorMessage(error) }),
   })
+
+function renderPiAuthEvent(event: AuthEvent) {
+  if (event.type === "auth_url") {
+    return Prompt.log.info([`Go to: ${event.url}`, event.instructions].filter((line) => line !== undefined).join("\n"))
+  }
+  if (event.type === "device_code") {
+    return Prompt.log.info(
+      [
+        `Go to: ${event.verificationUri}`,
+        `Enter code: ${event.userCode}`,
+        event.expiresInSeconds ? `Code expires in ${event.expiresInSeconds} seconds` : undefined,
+      ]
+        .filter((line) => line !== undefined)
+        .join("\n"),
+    )
+  }
+  if (event.type === "info") {
+    return Prompt.log.info(
+      [event.message, ...(event.links ?? []).map((link) => `${link.label ? `${link.label}: ` : ""}${link.url}`)].join(
+        "\n",
+      ),
+    )
+  }
+  return Prompt.log.info(event.message)
+}
+
+async function answerPiAuthPrompt(
+  bridge: EffectBridge.Shape,
+  input: { readonly sessionID: PiAIAuth.SessionID; readonly prompt: AuthPrompt },
+) {
+  input.prompt.signal?.throwIfAborted()
+  const answer =
+    input.prompt.type === "select"
+      ? await bridge.promise(
+          Prompt.select({
+            message: input.prompt.message,
+            options: input.prompt.options.map((option) => ({
+              value: option.id,
+              label: option.label,
+              hint: option.description,
+            })),
+            signal: input.prompt.signal,
+          }),
+        )
+      : input.prompt.type === "secret"
+        ? await bridge.promise(
+            Prompt.password({
+              message: input.prompt.message,
+              signal: input.prompt.signal,
+            }),
+          )
+        : await bridge.promise(
+            Prompt.text({
+              message: input.prompt.message,
+              placeholder: input.prompt.placeholder,
+              signal: input.prompt.signal,
+            }),
+          )
+  if (Option.isNone(answer)) throw new UI.CancelledError()
+  return answer.value
+}
+
+const handlePiAuth = Effect.fn("Cli.providers.piAuth")(function* (
+  models: Models,
+  provider: string,
+  methodName?: string,
+) {
+  const methods = PiAIAuth.methods(models, provider)
+  if (methods.length === 0) return false
+  const index = yield* Effect.gen(function* () {
+    if (!methodName) {
+      if (methods.length === 1) return 0
+      return yield* promptValue(
+        yield* Prompt.select({
+          message: "Login method",
+          options: methods.map((method, index) => ({ label: method.label, value: index })),
+        }),
+      )
+    }
+    const match = methods.findIndex((method) => method.label.toLowerCase() === methodName.toLowerCase())
+    if (match !== -1) return match
+    return yield* fail(
+      `Unknown method "${methodName}" for ${provider}. Available: ${methods.map((method) => method.label).join(", ")}`,
+    )
+  })
+
+  yield* Effect.sleep("10 millis")
+  const bridge = yield* EffectBridge.make()
+  const output = { pending: Promise.resolve() }
+  yield* Effect.tryPromise({
+    try: (signal) => {
+      const session = PiAIAuth.start({
+        models,
+        method: methods[index],
+        signal,
+        interaction: {
+          prompt: (input) => {
+            const answer = output.pending.then(() => answerPiAuthPrompt(bridge, input))
+            output.pending = answer.then(
+              () => undefined,
+              () => undefined,
+            )
+            return answer
+          },
+          notify: (input) => {
+            output.pending = output.pending.then(() => bridge.promise(renderPiAuthEvent(input.event)))
+          },
+        },
+      })
+      return session.result
+    },
+    catch: (error) => error,
+  }).pipe(
+    Effect.catch((error) =>
+      error instanceof UI.CancelledError
+        ? Effect.die(error)
+        : fail(`Failed to log in to ${provider}: ${errorMessage(error)}`),
+    ),
+  )
+  yield* Effect.promise(() => output.pending)
+  yield* Prompt.log.success("Login successful")
+  yield* Prompt.outro("Done")
+  return true
+})
+
+const handleConfiguredPiAuth = Effect.fn("Cli.providers.configuredPiAuth")(function* (
+  service: PiAIModels.Interface,
+  gate: PiAIModels.Gate,
+  provider: string,
+  methodName?: string,
+) {
+  if (!PiAIModels.enabled(gate, provider)) return false
+  return yield* handlePiAuth(yield* service.models(), provider, methodName)
+})
 
 const handlePluginAuth = Effect.fn("Cli.providers.pluginAuth")(function* (
   plugin: { auth: PluginAuth },
@@ -354,6 +492,7 @@ export const ProvidersLoginCommand = effectCmd({
     const cfgSvc = yield* Config.Service
     const pluginSvc = yield* Plugin.Service
     const modelsDev = yield* ModelsDev.Service
+    const piModels = yield* PiAIModels.Service
     yield* Effect.ignore(modelsDev.refresh(true))
 
     const config = yield* cfgSvc.get()
@@ -428,6 +567,12 @@ export const ProvidersLoginCommand = effectCmd({
       )
     }
 
+    if (
+      provider !== "other" &&
+      (yield* handleConfiguredPiAuth(piModels, config.experimental?.pi_ai, provider, args.method))
+    )
+      return
+
     const plugin = hooks.findLast((x) => x.auth?.provider === provider)
     if (plugin && plugin.auth) {
       const handled = yield* handlePluginAuth({ auth: plugin.auth! }, provider, args.method)
@@ -441,6 +586,8 @@ export const ProvidersLoginCommand = effectCmd({
           validate: (x) => (x && x.match(/^[0-9a-z-]+$/) ? undefined : "a-z, 0-9 and hyphens only"),
         }),
       )).replace(/^@ai-sdk\//, "")
+
+      if (yield* handleConfiguredPiAuth(piModels, config.experimental?.pi_ai, provider, args.method)) return
 
       const customPlugin = hooks.findLast((x) => x.auth?.provider === provider)
       if (customPlugin && customPlugin.auth) {
