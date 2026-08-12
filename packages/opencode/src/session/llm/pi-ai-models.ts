@@ -28,6 +28,7 @@ export type ResolveInput = {
   readonly provider: Provider.Info
   readonly auth: Auth.Info | undefined
   readonly runtime: Provider.RuntimeInfo
+  readonly explicitBaseURL?: boolean
 }
 
 export type Resolved = {
@@ -137,9 +138,28 @@ function resolvedModel(input: ResolveInput, models: MutableModels): Model<Api> |
   const template = models.getModel(providerID, input.model.api.id) ?? models.getModel(providerID, input.model.id)
   const current = settings(input)
   const api = current.api ?? template?.api ?? inferredApi(input.model.api.npm)
-  const baseUrl = input.runtime.baseURL ?? input.model.api.url ?? template?.baseUrl
+  const configuredBaseUrl =
+    input.explicitBaseURL === true ||
+    (input.explicitBaseURL === undefined &&
+      typeof input.provider.options.baseURL === "string" &&
+      input.provider.options.baseURL !== "")
+      ? input.runtime.baseURL
+      : undefined
+  const baseUrl =
+    configuredBaseUrl ||
+    template?.baseUrl ||
+    input.runtime.baseURL ||
+    input.model.api.url ||
+    models.getProvider(providerID)?.baseUrl
   if (!api || !baseUrl) return
 
+  // Anthropic OAuth with a plugin fetch wrapper uses subscription capacity,
+  // while the unwrapped OAuth endpoint is metered as extra usage.
+  const anthropicSubscription =
+    providerID === "anthropic" &&
+    input.auth?.type === "oauth" &&
+    input.runtime.authPlugin === true &&
+    input.runtime.fetch !== undefined
   const result = {
     ...template,
     id: input.model.api.id,
@@ -149,7 +169,9 @@ function resolvedModel(input: ResolveInput, models: MutableModels): Model<Api> |
     baseUrl,
     reasoning: input.model.capabilities.reasoning,
     input: ["text", ...(input.model.capabilities.input.image ? (["image"] as const) : [])],
-    cost: template?.cost ?? modelCost(input.model),
+    cost: anthropicSubscription
+      ? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+      : (template?.cost ?? modelCost(input.model)),
     contextWindow: input.model.limit.context,
     maxTokens: input.model.limit.output,
     samplingParams: { ...template?.samplingParams, ...current.samplingParams },
@@ -222,12 +244,26 @@ const layer = Layer.effect(
       const existing = current.custom.get(model.provider)
       if (existing) return Effect.promise(() => existing)
       const load = Promise.all([import("@earendil-works/pi-ai"), apiStreams()]).then(([pi, api]) => {
+        const apiKey = pi.envApiKeyAuth(`${input.provider.name} API key`, input.provider.env)
         current.models.setProvider(
           pi.createProvider({
             id: model.provider,
             name: input.provider.name,
             auth: {
-              apiKey: pi.envApiKeyAuth(`${input.provider.name} API key`, input.provider.env),
+              apiKey:
+                input.provider.env.length === 0
+                  ? {
+                      ...apiKey,
+                      async resolve(context) {
+                        return (
+                          (await apiKey.resolve(context)) ?? {
+                            auth: { apiKey: "unused" },
+                            source: "keyless provider",
+                          }
+                        )
+                      },
+                    }
+                  : apiKey,
             },
             models: [],
             api,

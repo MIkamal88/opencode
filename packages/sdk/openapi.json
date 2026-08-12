@@ -15586,6 +15586,9 @@
           },
           "enterpriseUrl": {
             "type": "string"
+          },
+          "metadata": {
+            "type": "object"
           }
         },
         "required": ["type", "refresh", "access", "expires"],
@@ -16928,6 +16931,9 @@
           },
           "snapshot": {
             "type": "string"
+          },
+          "providerMetadata": {
+            "$ref": "#/components/schemas/LLMProviderMetadata"
           },
           "cost": {
             "type": "number"
@@ -21543,6 +21549,26 @@
                 "type": "integer",
                 "exclusiveMinimum": 0
               },
+              "pi_ai": {
+                "anyOf": [
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "providers": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                ],
+                "description": "Enable the pi-ai runtime for all supported providers or an explicit provider allowlist"
+              },
               "policies": {
                 "type": "array",
                 "items": {
@@ -24527,6 +24553,12 @@
         "required": ["directory"],
         "additionalProperties": false
       },
+      "LLMProviderMetadata": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object"
+        }
+      },
       "ModelRef": {
         "type": "object",
         "properties": {
@@ -24621,12 +24653,6 @@
         },
         "required": ["type", "message"],
         "additionalProperties": false
-      },
-      "LLMProviderMetadata": {
-        "type": "object",
-        "additionalProperties": {
-          "type": "object"
-        }
       },
       "ToolTextContent": {
         "type": "object",

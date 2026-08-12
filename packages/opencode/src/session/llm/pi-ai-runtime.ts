@@ -93,6 +93,23 @@ function execute(input: StreamInput, event: LLMEvent) {
   )
 }
 
+function interruptible<T>(source: AsyncIterable<T>): AsyncIterable<T> {
+  return {
+    [Symbol.asyncIterator]() {
+      const iterator = source[Symbol.asyncIterator]()
+      return {
+        next: () => iterator.next(),
+        return: () => {
+          // pi-ai 0.84.1 waits inside next(), so awaiting return() would prevent
+          // the enclosing scope from aborting the provider request.
+          if (iterator.return) void iterator.return().catch(() => undefined)
+          return Promise.resolve({ done: true as const, value: undefined })
+        },
+      }
+    },
+  }
+}
+
 export const stream = Effect.fn("PiAIRuntime.stream")(function* (input: StreamInput) {
   const request = yield* Effect.promise(() =>
     PiAIRequest.prepare({
@@ -115,7 +132,7 @@ export const stream = Effect.fn("PiAIRuntime.stream")(function* (input: StreamIn
   }
   const events = input.resolved.models.streamSimple(input.resolved.model, request.context, {
     signal: input.abort,
-    apiKey: input.runtime.apiKey,
+    apiKey: input.runtime.apiKey || undefined,
     fetch: input.runtime.fetch,
     headers: { ...input.runtime.headers, ...input.headers },
     temperature: input.temperature,
@@ -132,7 +149,7 @@ export const stream = Effect.fn("PiAIRuntime.stream")(function* (input: StreamIn
     toolChoice: toolChoice(input),
   } as Parameters<typeof input.resolved.models.streamSimple>[2] & { toolChoice?: ReturnType<typeof toolChoice> })
   const state = PiAIEvents.adapterState()
-  const provider = Stream.fromAsyncIterable(events, (error) => error).pipe(
+  const provider = Stream.fromAsyncIterable(interruptible(events), (error) => error).pipe(
     Stream.mapEffect((event) => PiAIEvents.toLLMEvents(state, event)),
     Stream.flatMap((current) => Stream.fromIterable(current)),
   )

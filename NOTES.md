@@ -48,3 +48,17 @@ All engines must preserve the `LLMEvent` vocabulary. The pi-ai adapter must not 
 3. Assistant provenance and continuation metadata survive exact same-model turns and are conservatively lowered or removed on provider/model switches.
 4. OpenCode `auth.json` remains the only persisted credential store.
 5. The TUI and `SessionProcessor` consume the same types and events regardless of engine.
+
+## M1 Closure Verification
+
+- Terminal `providerMetadata` is persisted generically on successful and failed `step-finish` parts; the legacy OpenAPI and JavaScript SDK expose the optional field.
+- pi-ai 0.84.1 is patched reproducibly through Bun so a stored Codex `accountId` reaches both SSE and WebSocket transports and survives token refresh.
+- Matched pi catalog templates retain API-specific base URLs unless the user explicitly configured `provider.options.baseURL`, provider `api`, or model-level `provider.api`. This prevents OpenCode Go's Anthropic route from becoming `/v1/v1/messages` while preserving custom proxies.
+- Custom providers with no credential environment can run as keyless endpoints using an `unused` sentinel. Real credentials and configured environment variables still win.
+- Tool schemas enter constrained sampling only when the tool explicitly requests strict mode. Compatible strict schemas close object shapes recursively; optional properties and unsupported constraints fail explicit strict requests instead of silently rewriting semantics. Ordinary tools retain their original schemas.
+- pi's 0.84.1 async iterator blocks its own `return()` while awaiting an event. The OpenCode adapter detaches that return so scope finalization can abort the provider request; the abort/continuation regression passes repeatedly.
+- Exhausted pi provider failures persist terminal pi metadata only after OpenCode's outer retry policy finishes. Transient attempts do not create false terminal steps, and recoverable context overflow stays non-terminal so automatic compaction retains overflow replay semantics.
+- Anthropic subscription pricing requires an explicit auth-plugin runtime marker plus its compatibility fetch wrapper. The live verifier requires that marker, a successful final stop, pi provenance, authoritative cost evidence, no error event, and zero cost in plugin-backed Max mode.
+- Live verified: Anthropic Max through the installed compatibility fetch wrapper, OpenAI Codex, OpenCode Go's Anthropic/Completions/Responses matrix, and a keyless vLLM text plus exactly-once `read` tool continuation. Each selected `llm.runtime=pi-ai`; successful requests persisted pi provenance and authoritative usage/cost. Anthropic subscription requests persist zero monetary cost.
+- Live Claude → temporary OpenAI-compatible local → Claude switching succeeded in both directions, including paired Anthropic `read` call/result IDs and no provider-only signature fields on the local request. The local path also triggered normal `read` and `doom_loop` asks, and HTTP abort persisted a completed `MessageAbortedError` turn before successful continuation.
+- OpenRouter OAuth persisted through the generic callback flow in OpenCode's single credential store. `openrouter/openrouter/free` completed with `llm.runtime=pi-ai`, successful stop, pi provenance, real usage, and authoritative cost. M1 exit criteria are satisfied and the project rollout now includes OpenRouter.

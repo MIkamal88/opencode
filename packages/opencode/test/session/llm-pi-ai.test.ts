@@ -5,7 +5,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Usage } from "@opencode-ai/llm"
 import { Effect, Stream } from "effect"
-import { jsonSchema, tool, type ModelMessage } from "ai"
+import { jsonSchema, tool, type JSONSchema7, type ModelMessage } from "ai"
 import {
   createModels,
   fauxAssistantMessage,
@@ -50,7 +50,7 @@ describe("session.llm.pi-ai models", () => {
       const model = ProviderTest.model({
         id: ModelV2.ID.make(template.id),
         providerID: ProviderV2.ID.make("anthropic"),
-        api: { id: template.id, url: template.baseUrl, npm: "@ai-sdk/anthropic" },
+        api: { id: template.id, url: "https://catalog.example.test/v1", npm: "@ai-sdk/anthropic" },
         name: template.name,
         capabilities: {
           ...ProviderTest.model().capabilities,
@@ -67,7 +67,7 @@ describe("session.llm.pi-ai models", () => {
         model,
         provider,
         auth: undefined,
-        runtime: { baseURL: template.baseUrl, options: {} },
+        runtime: { baseURL: "https://catalog.example.test/v1", options: {} },
       })
       expect(result.type).toBe("supported")
       if (result.type === "unsupported") return
@@ -75,8 +75,103 @@ describe("session.llm.pi-ai models", () => {
         provider: "anthropic",
         id: template.id,
         api: template.api,
+        baseUrl: template.baseUrl,
         compat: template.compat,
       })
+    }),
+  )
+
+  it.instance("preserves an explicit base URL over a pi catalog template", () =>
+    Effect.gen(function* () {
+      const service = yield* PiAIModels.Service
+      const models = yield* service.models()
+      const template = models.getModels("anthropic")[0]
+      if (!template) return yield* Effect.die("missing anthropic test model")
+      const model = ProviderTest.model({
+        id: ModelV2.ID.make(template.id),
+        providerID: ProviderV2.ID.make("anthropic"),
+        api: { id: template.id, url: "https://catalog.example.test/v1", npm: "@ai-sdk/anthropic" },
+      })
+      const provider = ProviderTest.info(
+        { id: ProviderV2.ID.make("anthropic"), options: { baseURL: "https://proxy.example.test" } },
+        model,
+      )
+      const result = yield* service.resolve({
+        gate: true,
+        model,
+        provider,
+        auth: undefined,
+        runtime: { baseURL: "https://proxy.example.test", options: { baseURL: "https://proxy.example.test" } },
+        explicitBaseURL: true,
+      })
+      expect(result.type).toBe("supported")
+      if (result.type === "unsupported") return
+      expect(result.model.baseUrl).toBe("https://proxy.example.test")
+    }),
+  )
+
+  it.instance("preserves an explicit provider API over a pi catalog template", () =>
+    Effect.gen(function* () {
+      const service = yield* PiAIModels.Service
+      const models = yield* service.models()
+      const template = models.getModels("anthropic")[0]
+      if (!template) return yield* Effect.die("missing anthropic test model")
+      const model = ProviderTest.model({
+        id: ModelV2.ID.make(template.id),
+        providerID: ProviderV2.ID.make("anthropic"),
+        api: { id: template.id, url: "https://proxy.example.test", npm: "@ai-sdk/anthropic" },
+      })
+      const result = yield* service.resolve({
+        gate: true,
+        model,
+        provider: ProviderTest.info({ id: ProviderV2.ID.make("anthropic") }, model),
+        auth: undefined,
+        runtime: { baseURL: "https://proxy.example.test", options: {} },
+        explicitBaseURL: true,
+      })
+      expect(result.type).toBe("supported")
+      if (result.type === "unsupported") return
+      expect(result.model.baseUrl).toBe("https://proxy.example.test")
+    }),
+  )
+
+  it.instance("uses zero catalog cost for Anthropic subscription plugin requests", () =>
+    Effect.gen(function* () {
+      const service = yield* PiAIModels.Service
+      const models = yield* service.models()
+      const template = models.getModels("anthropic")[0]
+      if (!template) return yield* Effect.die("missing anthropic test model")
+      const model = ProviderTest.model({
+        id: ModelV2.ID.make(template.id),
+        providerID: ProviderV2.ID.make("anthropic"),
+        api: { id: template.id, url: template.baseUrl, npm: "@ai-sdk/anthropic" },
+        cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+      })
+      const customFetch = Object.assign(
+        (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => fetch(input, init),
+        { preconnect: () => undefined },
+      ) satisfies typeof fetch
+      const result = yield* service.resolve({
+        gate: true,
+        model,
+        provider: ProviderTest.info({ id: ProviderV2.ID.make("anthropic") }, model),
+        auth: { type: "oauth", access: "token", refresh: "refresh", expires: Date.now() + 60_000 },
+        runtime: { baseURL: template.baseUrl, apiKey: "", fetch: customFetch, authPlugin: true, options: {} },
+      })
+      expect(result.type).toBe("supported")
+      if (result.type === "unsupported") return
+      expect(result.model.cost).toMatchObject({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 })
+
+      const metered = yield* service.resolve({
+        gate: true,
+        model,
+        provider: ProviderTest.info({ id: ProviderV2.ID.make("anthropic") }, model),
+        auth: { type: "oauth", access: "token", refresh: "refresh", expires: Date.now() + 60_000 },
+        runtime: { baseURL: template.baseUrl, fetch: customFetch, options: {} },
+      })
+      expect(metered.type).toBe("supported")
+      if (metered.type === "unsupported") return
+      expect(metered.model.cost).toEqual(template.cost)
     }),
   )
 
@@ -95,7 +190,7 @@ describe("session.llm.pi-ai models", () => {
       const provider = ProviderTest.info(
         {
           id: ProviderV2.ID.make("local-test"),
-          env: ["LOCAL_TEST_API_KEY"],
+          env: [],
           options: { pi_ai: { compat: { supportsUsageInStreaming: false } } },
         },
         model,
@@ -105,7 +200,7 @@ describe("session.llm.pi-ai models", () => {
         model,
         provider,
         auth: undefined,
-        runtime: { baseURL: "http://127.0.0.1:11434/v1", apiKey: "local", options: {} },
+        runtime: { baseURL: "http://127.0.0.1:11434/v1", options: {} },
       })
       expect(result.type).toBe("supported")
       if (result.type === "unsupported") return
@@ -117,6 +212,10 @@ describe("session.llm.pi-ai models", () => {
         compat: { supportsUsageInStreaming: false },
       })
       expect(result.models.getProvider("local-test")).toBeDefined()
+      expect(yield* Effect.promise(() => result.models.getAuth(result.model))).toMatchObject({
+        auth: { apiKey: "unused" },
+        source: "keyless provider",
+      })
     }),
   )
 
@@ -211,6 +310,58 @@ describe("session.llm.pi-ai models", () => {
       expect(yield* auth.get("openai")).toMatchObject({ type: "oauth", access: "new-access" })
       yield* Effect.promise(() => models.logout("openai-codex"))
       expect(yield* auth.get("openai")).toBeUndefined()
+    }),
+  )
+
+  it.instance("carries a stored Codex account ID through Models dispatch", () =>
+    Effect.gen(function* () {
+      const service = yield* PiAIModels.Service
+      const auth = yield* Auth.Service
+      const models = yield* service.models()
+      const token = [
+        Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url"),
+        Buffer.from(JSON.stringify({ sub: "claimless" })).toString("base64url"),
+        "signature",
+      ].join(".")
+      yield* auth.set("openai", {
+        type: "oauth",
+        access: token,
+        refresh: "refresh",
+        expires: Date.now() + 60 * 60 * 1000,
+        accountId: "account-test",
+      })
+
+      expect(yield* Effect.promise(() => models.getAuth("openai-codex"))).toMatchObject({
+        auth: { apiKey: token, headers: { "chatgpt-account-id": "account-test" } },
+      })
+      const model = models.getModels("openai-codex")[0]
+      if (!model) return yield* Effect.die("missing Codex test model")
+      const sent = Promise.withResolvers<Headers>()
+      const customFetch = Object.assign(
+        async (input: Parameters<typeof fetch>[0], init: Parameters<typeof fetch>[1]) => {
+          sent.resolve(new Request(input, init).headers)
+          return new Response(JSON.stringify({ error: { message: "expected test stop" } }), { status: 400 })
+        },
+        { preconnect: () => undefined },
+      ) satisfies typeof fetch
+      const events = models.streamSimple(
+        model,
+        { systemPrompt: "system", messages: [{ role: "user", content: "test", timestamp: 1 }], tools: [] },
+        {
+          transport: "sse",
+          maxRetries: 0,
+          fetch: customFetch,
+        },
+      )
+      yield* Effect.promise(async () => {
+        for await (const event of events) {
+          if (event.type === "error") return
+        }
+      })
+      const headers = yield* Effect.promise(() => sent.promise)
+      expect(headers.get("authorization")).toBe(`Bearer ${token}`)
+      expect(headers.get("chatgpt-account-id")).toBe("account-test")
+      yield* auth.remove("openai")
     }),
   )
 
@@ -340,6 +491,110 @@ describe("session.llm.pi-ai models", () => {
         },
         { role: "toolResult", toolCallId: "call-1", toolName: "lookup", isError: false },
       ])
+    }),
+  )
+
+  it.instance("closes object tool schemas before enabling constrained sampling", () =>
+    Effect.gen(function* () {
+      const faux = fauxProvider({ provider: "faux-opencode" })
+      const result = yield* Effect.promise(() =>
+        PiAIRequest.prepare({
+          model: faux.getModel(),
+          system: ["system"],
+          messages: [{ role: "user", content: "lookup" }],
+          tools: {
+            lookup: tool({
+              description: "Lookup",
+              strict: true,
+              inputSchema: jsonSchema({
+                type: "object",
+                properties: {
+                  query: { type: "string" },
+                  options: {
+                    type: "object",
+                    properties: { limit: { type: "number" } },
+                    required: ["limit"],
+                  },
+                  mode: { enum: [{ type: "object", properties: { untouched: true } }] },
+                },
+                required: ["query", "options", "mode"],
+              }),
+            }),
+            bounded: tool({
+              description: "Bounded lookup",
+              inputSchema: jsonSchema({
+                type: "object",
+                properties: { limit: { type: "integer", minimum: 0 } },
+                required: ["limit"],
+              }),
+            }),
+          },
+          abort: new AbortController().signal,
+          source: () => faux.getModel(),
+        }),
+      )
+      expect(result.type).toBe("supported")
+      if (result.type === "unsupported") return
+      expect(result.context.tools).toMatchObject([
+        {
+          name: "lookup",
+          parameters: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              options: { type: "object", additionalProperties: false },
+              mode: { enum: [{ type: "object", properties: { untouched: true } }] },
+            },
+          },
+          constrainedSampling: { type: "json_schema", strict: "require" },
+        },
+        {
+          name: "bounded",
+          parameters: {
+            type: "object",
+            properties: { limit: { type: "integer", minimum: 0 } },
+          },
+          constrainedSampling: false,
+        },
+      ])
+
+      yield* Effect.promise(async () => {
+        const invalidSchemas: JSONSchema7[] = [
+          {
+            type: "object",
+            properties: { optional: { type: "string" } },
+            required: [],
+          },
+          {
+            type: "object",
+            properties: {
+              tuple: {
+                type: "array",
+                items: [
+                  {
+                    type: "object",
+                    properties: { optional: { type: "string" } },
+                    required: [],
+                  },
+                ],
+              },
+            },
+            required: ["tuple"],
+          },
+        ]
+        for (const inputSchema of invalidSchemas) {
+          await expect(
+            PiAIRequest.prepare({
+              model: faux.getModel(),
+              system: ["system"],
+              messages: [{ role: "user", content: "lookup" }],
+              tools: { invalid: tool({ strict: true, inputSchema: jsonSchema(inputSchema) }) },
+              abort: new AbortController().signal,
+              source: () => faux.getModel(),
+            }),
+          ).rejects.toThrow('Tool "invalid" requires strict sampling but its schema is not strict-compatible')
+        }
+      })
     }),
   )
 

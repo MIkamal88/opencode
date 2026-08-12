@@ -1,0 +1,71 @@
+diff --git a/dist/api/openai-codex-responses.js b/dist/api/openai-codex-responses.js
+--- a/dist/api/openai-codex-responses.js
++++ b/dist/api/openai-codex-responses.js
+@@ -171,7 +171,7 @@ export const stream = (model, context, options) => {
+             if (!apiKey) {
+                 throw new Error(`No API key for provider: ${model.provider}`);
+             }
+-            const accountId = extractAccountId(apiKey);
++            const accountId = accountIdFromHeaders(model.headers, options?.headers) ?? extractAccountId(apiKey);
+             const grammarToolInputProperties = createGrammarToolInputProperties(context.tools, model.compat?.supportsOpenAIGrammarTools ?? false);
+             const cacheSessionId = options?.cacheRetention === "none" ? undefined : options?.sessionId;
+             const codexSessionId = clampOpenAIPromptCacheKey(cacheSessionId);
+@@ -1236,6 +1236,21 @@ function parseErrorResponse(response) {
+ // ============================================================================
+ // Auth & Headers
+ // ============================================================================
++function accountIdFromHeaders(...sources) {
++    const headers = new Headers();
++    for (const source of sources) {
++        for (const [key, value] of Object.entries(source ?? {})) {
++            if (value === null) {
++                headers.delete(key);
++            }
++            else {
++                headers.set(key, value);
++            }
++        }
++    }
++    const accountId = headers.get("chatgpt-account-id")?.trim();
++    return accountId || undefined;
++}
+ function extractAccountId(token) {
+     try {
+         const parts = token.split(".");
+diff --git a/dist/auth/oauth/openai-codex.js b/dist/auth/oauth/openai-codex.js
+--- a/dist/auth/oauth/openai-codex.js
++++ b/dist/auth/oauth/openai-codex.js
+@@ -419,8 +419,13 @@ async function loginOpenAICodex(interaction) {
+ /**
+  * Refresh OpenAI Codex OAuth token
+  */
+-async function refreshOpenAICodexToken(refreshToken, signal) {
+-    return credentialsFromToken(await refreshAccessToken(refreshToken, signal));
++async function refreshOpenAICodexToken(credential, signal) {
++    const token = await refreshAccessToken(credential.refresh, signal);
++    const accountId = getAccountId(token.access) ?? credential.accountId;
++    if (!accountId) {
++        throw new Error("Failed to extract accountId from token");
++    }
++    return { type: "oauth", ...token, accountId };
+ }
+ export const openaiCodexOAuth = {
+     name: "OpenAI (ChatGPT Plus/Pro)",
+@@ -442,9 +447,15 @@ export const openaiCodexOAuth = {
+         }
+         return loginOpenAICodex(interaction);
+     },
+-    refresh: (credential, signal) => refreshOpenAICodexToken(credential.refresh, signal),
++    refresh: (credential, signal) => refreshOpenAICodexToken(credential, signal),
+     async toAuth(credential) {
+-        return { apiKey: credential.access };
++        const accountId = typeof credential.accountId === "string" && credential.accountId.length > 0
++            ? credential.accountId
++            : getAccountId(credential.access);
++        return {
++            apiKey: credential.access,
++            ...(accountId ? { headers: { "chatgpt-account-id": accountId } } : {}),
++        };
+     },
+ };
+ //# sourceMappingURL=openai-codex.js.map

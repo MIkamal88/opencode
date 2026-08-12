@@ -76,6 +76,15 @@ function finishMetadata(message: AssistantMessage): ProviderMetadata {
   }
 }
 
+export function failureEvent(message: AssistantMessage) {
+  return LLMEvent.stepFinish({
+    index: 0,
+    reason: "error",
+    usage: usage(message),
+    providerMetadata: finishMetadata(message),
+  })
+}
+
 function finishReason(reason: AssistantMessage["stopReason"]) {
   if (reason === "stop") return "stop" as const
   if (reason === "length") return "length" as const

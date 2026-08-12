@@ -31,6 +31,7 @@ import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
 import { PiAIModels } from "./llm/pi-ai-models"
 import { PiAIRuntime } from "./llm/pi-ai-runtime"
+import { PiAIEvents, PiAIProviderError } from "./llm/pi-ai-events"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
@@ -114,7 +115,25 @@ const live: Layer.Layer<
         provider: item,
         auth: info,
         runtime,
+        explicitBaseURL: (() => {
+          const configured = cfg.provider?.[input.model.providerID]
+          const model = configured?.models?.[input.model.id]
+          return (
+            (typeof configured?.options?.baseURL === "string" && configured.options.baseURL !== "") ||
+            (typeof configured?.options?.endpoint === "string" && configured.options.endpoint !== "") ||
+            (typeof configured?.api === "string" && configured.api !== "") ||
+            (typeof model?.provider?.api === "string" && model.provider.api !== "")
+          )
+        })(),
       })
+      if (pi.type === "unsupported") {
+        yield* Effect.logDebug("pi-ai runtime unavailable; falling back", {
+          providerID: input.model.providerID,
+          modelID: input.model.id,
+          "session.id": input.sessionID,
+          reason: pi.reason,
+        })
+      }
       const nativeStatus = flags.experimentalNativeLlm
         ? LLMNativeRuntime.status({ model: input.model, provider: item, auth: info })
         : { type: "unsupported" as const, reason: "native runtime is disabled" }
@@ -268,6 +287,7 @@ const live: Layer.Layer<
             "llm.model": input.model.id,
             "llm.pi_provider": pi.model.provider,
             "llm.pi_api": pi.model.api,
+            "llm.auth_plugin": runtime.authPlugin === true,
           })
           return {
             type: "pi-ai" as const,
@@ -447,6 +467,11 @@ const live: Layer.Layer<
 )
 
 export const hasToolCalls = LLMRequestPrep.hasToolCalls
+
+export function terminalFailure(error: unknown) {
+  if (!(error instanceof PiAIProviderError)) return
+  return PiAIEvents.failureEvent(error.response)
+}
 
 export const node = LayerNode.make({
   service: Service,

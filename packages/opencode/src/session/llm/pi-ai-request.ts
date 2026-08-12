@@ -328,18 +328,102 @@ function suffixMessages(messages: readonly ModelMessage[], model: Model<Api>): M
   })
 }
 
+function strictSchema(value: unknown): { schema: unknown; compatible: boolean } {
+  if (!isRecord(value)) return { schema: value, compatible: false }
+
+  const schema = { ...value }
+  const results: Array<{ schema: unknown; compatible: boolean }> = []
+  const record = (key: string) => {
+    if (!isRecord(value[key])) return
+    const entries = Object.entries(value[key]).map(([name, item]) => {
+      const result = strictSchema(item)
+      results.push(result)
+      return [name, result.schema]
+    })
+    schema[key] = Object.fromEntries(entries)
+  }
+  const union = (key: string) => {
+    if (!Array.isArray(value[key])) return
+    const entries = value[key].map(strictSchema)
+    results.push(...entries)
+    schema[key] = entries.map((item) => item.schema)
+  }
+
+  record("properties")
+  record("$defs")
+  record("definitions")
+  for (const key of ["anyOf", "oneOf", "allOf"]) union(key)
+  const invalidItems = "items" in value && !isRecord(value.items)
+  if (isRecord(value.items)) {
+    const items = strictSchema(value.items)
+    results.push(items)
+    schema.items = items.schema
+  }
+
+  const object =
+    schema.type === "object" ||
+    (Array.isArray(schema.type) && schema.type.includes("object")) ||
+    isRecord(schema.properties)
+  const open = object && "additionalProperties" in schema && schema.additionalProperties !== false
+  const unsupported = [
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    "minLength",
+    "maxLength",
+    "pattern",
+    "format",
+    "minItems",
+    "maxItems",
+    "uniqueItems",
+    "minProperties",
+    "maxProperties",
+    "patternProperties",
+    "default",
+    "examples",
+    "prefixItems",
+    "contains",
+    "if",
+    "then",
+    "else",
+    "not",
+    "dependentSchemas",
+    "propertyNames",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+  ].some((key) => key in schema)
+  const properties = isRecord(schema.properties) ? Object.keys(schema.properties) : []
+  const required = new Set(
+    Array.isArray(schema.required) ? schema.required.filter((item) => typeof item === "string") : [],
+  )
+  const optional = object && properties.some((key) => !required.has(key))
+  if (object && !("additionalProperties" in schema)) schema.additionalProperties = false
+  return {
+    schema,
+    compatible: !open && !optional && !unsupported && !invalidItems && results.every((item) => item.compatible),
+  }
+}
+
 async function toolDefinitions(input: Record<string, Tool>): Promise<Context["tools"]> {
   const { Type } = await import("@earendil-works/pi-ai")
   return Object.entries(input).map(([name, item]) => {
-    const schema = asSchema(item.inputSchema).jsonSchema
+    const raw = asSchema(item.inputSchema).jsonSchema
+    const normalized = item.strict === true ? strictSchema(raw) : { schema: raw, compatible: false }
+    if (item.strict === true && !normalized.compatible) {
+      throw new Error(`Tool "${name}" requires strict sampling but its schema is not strict-compatible`)
+    }
     return {
       name,
       description: item.description ?? "",
-      parameters: Type.Unsafe<Record<string, unknown>>(schema),
+      parameters: Type.Unsafe<Record<string, unknown>>(normalized.schema as Record<string, unknown>),
       constrainedSampling:
-        item.strict === false
-          ? false
-          : { type: "json_schema" as const, strict: item.strict === true ? ("require" as const) : ("prefer" as const) },
+        item.strict === true && normalized.compatible
+          ? ({ type: "json_schema" as const, strict: "require" as const } satisfies NonNullable<
+              Context["tools"]
+            >[number]["constrainedSampling"])
+          : false,
     }
   })
 }

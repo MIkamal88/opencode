@@ -1169,6 +1169,7 @@ export type RuntimeInfo = {
   readonly apiKey?: string
   readonly headers?: Record<string, string>
   readonly fetch?: typeof globalThis.fetch
+  readonly authPlugin?: boolean
   readonly options: Record<string, any>
 }
 
@@ -1179,6 +1180,7 @@ interface State {
   sdk: Map<string, BundledSDK>
   modelLoaders: Record<string, CustomModelLoader>
   varsLoaders: Record<string, CustomVarsLoader>
+  authPlugins: Set<ProviderV2.ID>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Provider") {}
@@ -1366,6 +1368,7 @@ const layer = Layer.effect(
           [providerID: string]: CustomVarsLoader
         } = {}
         const sdk = new Map<string, BundledSDK>()
+        const authPlugins = new Set<ProviderV2.ID>()
         const discoveryLoaders: {
           [providerID: string]: CustomDiscoverModels
         } = {}
@@ -1571,6 +1574,7 @@ const layer = Layer.effect(
             ),
           )
           const opts = options ?? {}
+          authPlugins.add(providerID)
           const patch: Partial<Info> = providers[providerID] ? { options: opts } : { source: "custom", options: opts }
           mergeProvider(providerID, patch)
         }
@@ -1673,6 +1677,7 @@ const layer = Layer.effect(
           sdk,
           modelLoaders,
           varsLoaders,
+          authPlugins,
         }
       }),
     )
@@ -1738,6 +1743,7 @@ const layer = Layer.effect(
         apiKey: typeof options.apiKey === "string" ? options.apiKey : undefined,
         headers,
         fetch: typeof options.fetch === "function" ? (options.fetch as typeof globalThis.fetch) : undefined,
+        authPlugin: s.authPlugins.has(model.providerID),
         options,
       }
     }

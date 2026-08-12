@@ -113,6 +113,9 @@ export type OAuth = {
   expires: number
   accountId?: string
   enterpriseUrl?: string
+  metadata?: {
+    [key: string]: unknown
+  }
 }
 
 export type ApiAuth = {
@@ -559,6 +562,7 @@ export type StepFinishPart = {
   type: "step-finish"
   reason: string
   snapshot?: string
+  providerMetadata?: LlmProviderMetadata
   cost: number
   tokens: {
     total?: number
@@ -2025,6 +2029,14 @@ export type Config = {
     primary_tools?: Array<string>
     continue_loop_on_deny?: boolean
     mcp_timeout?: number
+    /**
+     * Enable the pi-ai runtime for all supported providers or an explicit provider allowlist
+     */
+    pi_ai?:
+      | boolean
+      | {
+          providers?: Array<string>
+        }
     policies?: Array<ConfigV2ExperimentalPolicy>
   }
 }
@@ -3035,6 +3047,12 @@ export type MoveSessionDestination = {
   directory: string
 }
 
+export type LlmProviderMetadata = {
+  [key: string]: {
+    [key: string]: unknown
+  }
+}
+
 export type ModelRef = {
   id: string
   providerID: string
@@ -3068,12 +3086,6 @@ export type PromptAgentAttachment = {
 export type SessionErrorUnknown = {
   type: "unknown"
   message: string
-}
-
-export type LlmProviderMetadata = {
-  [key: string]: {
-    [key: string]: unknown
-  }
 }
 
 export type ToolTextContent = {
