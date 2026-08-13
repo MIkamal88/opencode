@@ -4,7 +4,7 @@
 // https://github.com/cline/cline/blob/main/evals/diff-edits/diff-apply/diff-06-26-25.ts
 
 import * as path from "path"
-import { Effect, Schema, Semaphore } from "effect"
+import { Effect, Schema } from "effect"
 import * as Tool from "./tool"
 import { LSP } from "@/lsp/lsp"
 import { createTwoFilesPatch, diffLines } from "diff"
@@ -18,6 +18,7 @@ import { Snapshot } from "@/snapshot"
 import { assertExternalDirectoryEffect } from "./external-directory"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import * as Bom from "@/util/bom"
+import { FileMutationState } from "./file-mutation-state"
 
 function normalizeLineEndings(text: string): string {
   return text.replaceAll("\r\n", "\n")
@@ -32,19 +33,7 @@ function convertToLineEnding(text: string, ending: "\n" | "\r\n"): string {
   return text.replaceAll("\n", "\r\n")
 }
 
-const locks = new Map<string, Semaphore.Semaphore>()
-
-function lock(filePath: string) {
-  const resolvedFilePath = FSUtil.resolve(filePath)
-  const hit = locks.get(resolvedFilePath)
-  if (hit) return hit
-
-  const next = Semaphore.makeUnsafe(1)
-  locks.set(resolvedFilePath, next)
-  return next
-}
-
-export const Parameters = Schema.Struct({
+const LegacyParameters = Schema.Struct({
   filePath: Schema.String.annotate({ description: "The absolute path to the file to modify" }),
   oldString: Schema.String.annotate({ description: "The text to replace" }),
   newString: Schema.String.annotate({
@@ -53,7 +42,23 @@ export const Parameters = Schema.Struct({
   replaceAll: Schema.optional(Schema.Boolean).annotate({
     description: "Replace all occurrences of oldString (default false)",
   }),
+  edits: Schema.optionalKey(Schema.Never),
 })
+
+const BatchParameters = Schema.Struct({
+  filePath: Schema.String.annotate({ description: "The absolute path to the file to modify" }),
+  edits: Schema.NonEmptyArray(
+    Schema.Struct({
+      oldString: Schema.String.annotate({ description: "The text to replace in the original file snapshot" }),
+      newString: Schema.String.annotate({ description: "The replacement text" }),
+    }),
+  ).annotate({ description: "Disjoint replacements matched against the same original file snapshot" }),
+  oldString: Schema.optionalKey(Schema.Never),
+  newString: Schema.optionalKey(Schema.Never),
+  replaceAll: Schema.optionalKey(Schema.Never),
+})
+
+export const Parameters = Schema.Union([LegacyParameters, BatchParameters])
 
 export const EditTool = Tool.define(
   "edit",
@@ -62,6 +67,7 @@ export const EditTool = Tool.define(
     const afs = yield* FSUtil.Service
     const format = yield* Format.Service
     const events = yield* EventV2Bridge.Service
+    const mutations = yield* FileMutationState.Service
 
     return {
       description: DESCRIPTION,
@@ -72,105 +78,173 @@ export const EditTool = Tool.define(
             throw new Error("filePath is required")
           }
 
-          if (params.oldString === params.newString) {
+          if ("oldString" in params && params.oldString === params.newString) {
             throw new Error("No changes to apply: oldString and newString are identical.")
           }
 
           const instance = yield* InstanceState.context
-          const filePath = path.isAbsolute(params.filePath)
+          const requestedPath = path.isAbsolute(params.filePath)
             ? params.filePath
             : path.join(instance.directory, params.filePath)
+          const filePath = yield* mutations.canonical(requestedPath)
           yield* assertExternalDirectoryEffect(ctx, filePath)
 
           let diff = ""
           let contentOld = ""
           let contentNew = ""
-          yield* lock(filePath).withPermits(1)(
+          yield* Effect.uninterruptibleMask((restore) =>
             Effect.gen(function* () {
-              if (params.oldString === "") {
-                const existed = yield* afs.existsSafe(filePath)
-                if (existed) {
-                  throw new Error(
-                    "oldString cannot be empty when editing an existing file. Provide the exact text to replace, or use write for an intentional full-file replacement.",
+              const lease = yield* restore(mutations.acquireLock(filePath))
+              yield* restore(
+                Effect.gen(function* () {
+                  if ("oldString" in params && params.oldString === "") {
+                    const existed = yield* afs.existsSafe(filePath)
+                    if (existed) {
+                      throw new Error(
+                        "oldString cannot be empty when editing an existing file. Provide the exact text to replace, or use write for an intentional full-file replacement.",
+                      )
+                    }
+                    const next = Bom.split(params.newString)
+                    const desiredBom = next.bom
+                    contentOld = ""
+                    contentNew = next.text
+                    diff = trimDiff(createTwoFilesPatch(filePath, filePath, contentOld, contentNew))
+                    yield* ctx.ask({
+                      permission: "edit",
+                      patterns: [path.relative(instance.worktree, filePath)],
+                      always: ["*"],
+                      metadata: {
+                        filepath: filePath,
+                        diff,
+                      },
+                    })
+                    const authorizedPath = yield* mutations.canonical(requestedPath)
+                    if (authorizedPath !== filePath) {
+                      throw new Error(
+                        `File ${filePath} was created or redirected while waiting for permission. Read it before editing.`,
+                      )
+                    }
+                    const write = afs.writeFileString(filePath, Bom.join(contentNew, desiredBom), { flag: "wx" })
+                    yield* write.pipe(
+                      Effect.catchReason("PlatformError", "NotFound", () =>
+                        afs.ensureDir(path.dirname(filePath)).pipe(Effect.andThen(write)),
+                      ),
+                      Effect.catchReason("PlatformError", "AlreadyExists", () =>
+                        Effect.fail(
+                          new Error(
+                            `File ${filePath} was created while waiting for permission. Read it before editing.`,
+                          ),
+                        ),
+                      ),
+                    )
+                    if (yield* format.file(filePath)) {
+                      contentNew = yield* Bom.syncFile(afs, filePath, desiredBom)
+                    }
+                    yield* events.publish(FileSystem.Event.Edited, { file: filePath })
+                    yield* events.publish(Watcher.Event.Updated, {
+                      file: filePath,
+                      event: "add",
+                    })
+                    if (ctx.receipt) {
+                      yield* ctx.receipt.settle({
+                        canonicalPath: filePath,
+                        digest: mutations.digest(yield* afs.readFile(filePath)),
+                        release: () => lease.release,
+                      })
+                      if (!ctx.receipt.pending()?.release) yield* lease.release
+                    } else {
+                      yield* lease.release
+                    }
+                    return
+                  }
+
+                  const info = yield* afs.stat(filePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
+                  if (!info) throw new Error(`File ${filePath} not found`)
+                  if (info.type === "Directory") throw new Error(`Path is a directory, not a file: ${filePath}`)
+                  const receipt = ctx.receipt
+                  if (!receipt) throw new Error("The internal read receipt channel is unavailable.")
+                  const original = yield* mutations.snapshot(filePath)
+                  const source = Bom.decode(original.content)
+                  contentOld = source.text
+                  const digestOld = mutations.digest(original.content)
+                  if (!(yield* receipt.match({ canonicalPath: filePath, digest: digestOld }))) {
+                    throw new Error(
+                      `File ${filePath} has not been read in this session or has changed since it was read. Read it again before editing.`,
+                    )
+                  }
+
+                  const ending = detectLineEnding(contentOld)
+                  const edited =
+                    params.edits !== undefined
+                      ? batchReplace(contentOld, params.edits, ending)
+                      : replace(
+                          contentOld,
+                          convertToLineEnding(normalizeLineEndings(params.oldString), ending),
+                          convertToLineEnding(normalizeLineEndings(params.newString), ending),
+                          params.replaceAll,
+                        )
+                  const next = Bom.split(edited)
+                  const desiredBom = source.bom || next.bom
+                  contentNew = next.text
+
+                  diff = trimDiff(
+                    createTwoFilesPatch(
+                      filePath,
+                      filePath,
+                      normalizeLineEndings(contentOld),
+                      normalizeLineEndings(contentNew),
+                    ),
                   )
-                }
-                const next = Bom.split(params.newString)
-                const desiredBom = next.bom
-                contentOld = ""
-                contentNew = next.text
-                diff = trimDiff(createTwoFilesPatch(filePath, filePath, contentOld, contentNew))
-                yield* ctx.ask({
-                  permission: "edit",
-                  patterns: [path.relative(instance.worktree, filePath)],
-                  always: ["*"],
-                  metadata: {
-                    filepath: filePath,
-                    diff,
-                  },
-                })
-                yield* afs.writeWithDirs(filePath, Bom.join(contentNew, desiredBom))
-                if (yield* format.file(filePath)) {
-                  contentNew = yield* Bom.syncFile(afs, filePath, desiredBom)
-                }
-                yield* events.publish(FileSystem.Event.Edited, { file: filePath })
-                yield* events.publish(Watcher.Event.Updated, {
-                  file: filePath,
-                  event: "add",
-                })
-                return
-              }
+                  yield* ctx.ask({
+                    permission: "edit",
+                    patterns: [path.relative(instance.worktree, filePath)],
+                    always: ["*"],
+                    metadata: {
+                      filepath: filePath,
+                      diff,
+                    },
+                  })
 
-              const info = yield* afs.stat(filePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
-              if (!info) throw new Error(`File ${filePath} not found`)
-              if (info.type === "Directory") throw new Error(`Path is a directory, not a file: ${filePath}`)
-              const source = yield* Bom.readFile(afs, filePath)
-              contentOld = source.text
-
-              const ending = detectLineEnding(contentOld)
-              const old = convertToLineEnding(normalizeLineEndings(params.oldString), ending)
-              const replacement = convertToLineEnding(normalizeLineEndings(params.newString), ending)
-
-              const next = Bom.split(replace(contentOld, old, replacement, params.replaceAll))
-              const desiredBom = source.bom || next.bom
-              contentNew = next.text
-
-              diff = trimDiff(
-                createTwoFilesPatch(
-                  filePath,
-                  filePath,
-                  normalizeLineEndings(contentOld),
-                  normalizeLineEndings(contentNew),
-                ),
-              )
-              yield* ctx.ask({
-                permission: "edit",
-                patterns: [path.relative(instance.worktree, filePath)],
-                always: ["*"],
-                metadata: {
-                  filepath: filePath,
-                  diff,
-                },
-              })
-
-              yield* afs.writeWithDirs(filePath, Bom.join(contentNew, desiredBom))
-              if (yield* format.file(filePath)) {
-                contentNew = yield* Bom.syncFile(afs, filePath, desiredBom)
-              }
-              yield* events.publish(FileSystem.Event.Edited, { file: filePath })
-              yield* events.publish(Watcher.Event.Updated, {
-                file: filePath,
-                event: "change",
-              })
-              diff = trimDiff(
-                createTwoFilesPatch(
-                  filePath,
-                  filePath,
-                  normalizeLineEndings(contentOld),
-                  normalizeLineEndings(contentNew),
-                ),
-              )
-            }).pipe(Effect.orDie),
-          )
+                  const authorizedPath = yield* mutations.canonical(requestedPath)
+                  if (authorizedPath !== filePath) {
+                    throw new Error(
+                      `File ${filePath} was redirected while waiting for permission. Read it again before editing.`,
+                    )
+                  }
+                  const checked = yield* mutations.snapshot(filePath)
+                  if (!mutations.sameIdentity(original, checked) || mutations.digest(checked.content) !== digestOld) {
+                    throw new Error(
+                      `File ${filePath} changed while waiting for permission. Read it again before editing.`,
+                    )
+                  }
+                  yield* receipt.invalidate({ canonicalPath: filePath })
+                  yield* afs.writeWithDirs(filePath, Bom.join(contentNew, desiredBom))
+                  if (yield* format.file(filePath)) {
+                    contentNew = yield* Bom.syncFile(afs, filePath, desiredBom)
+                  }
+                  yield* events.publish(FileSystem.Event.Edited, { file: filePath })
+                  yield* events.publish(Watcher.Event.Updated, {
+                    file: filePath,
+                    event: "change",
+                  })
+                  diff = trimDiff(
+                    createTwoFilesPatch(
+                      filePath,
+                      filePath,
+                      normalizeLineEndings(contentOld),
+                      normalizeLineEndings(contentNew),
+                    ),
+                  )
+                  yield* receipt.settle({
+                    canonicalPath: filePath,
+                    digest: mutations.digest(yield* afs.readFile(filePath)),
+                    release: () => lease.release,
+                  })
+                  if (!receipt.pending()?.release) yield* lease.release
+                }),
+              ).pipe(Effect.onError(() => lease.release))
+            }),
+          ).pipe(Effect.orDie)
 
           let additions = 0
           let deletions = 0
@@ -372,10 +446,7 @@ export const BlockAnchorReplacer: Replacer = function* (content, find) {
     return
   }
 
-  // Calculate similarity for multiple candidates
-  let bestMatch: { startLine: number; endLine: number } | null = null
-  let maxSimilarity = -1
-
+  // Yield every plausible candidate so the batch planner can reject ambiguity.
   for (const candidate of candidates) {
     const { startLine, endLine } = candidate
     const actualBlockSize = endLine - startLine + 1
@@ -400,15 +471,7 @@ export const BlockAnchorReplacer: Replacer = function* (content, find) {
       similarity = 1.0
     }
 
-    if (similarity > maxSimilarity) {
-      maxSimilarity = similarity
-      bestMatch = candidate
-    }
-  }
-
-  // Threshold judgment
-  if (maxSimilarity >= MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD && bestMatch) {
-    const { startLine, endLine } = bestMatch
+    if (similarity < MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD) continue
     let matchStartIndex = 0
     for (let k = 0; k < startLine; k++) {
       matchStartIndex += originalLines[k].length + 1
@@ -726,6 +789,77 @@ export function replace(content: string, oldString: string, newString: string, r
     )
   }
   throw new Error("Found multiple matches for oldString. Provide more surrounding context to make the match unique.")
+}
+
+function batchReplace(
+  content: string,
+  edits: ReadonlyArray<{ oldString: string; newString: string }>,
+  ending: "\n" | "\r\n",
+) {
+  if (edits.length === 0) throw new Error("edits must contain at least one replacement.")
+  const ranges = edits.map((edit, index) => {
+    if (edit.oldString === "") throw new Error(`edits[${index}]: oldString cannot be empty.`)
+    if (edit.oldString === edit.newString) throw new Error(`edits[${index}]: oldString and newString are identical.`)
+    const oldString = convertToLineEnding(normalizeLineEndings(edit.oldString), ending)
+    const newString = convertToLineEnding(normalizeLineEndings(edit.newString), ending)
+    try {
+      const search = findUniqueMatch(content, oldString)
+      return { index, start: content.indexOf(search), end: content.indexOf(search) + search.length, newString }
+    } catch (error) {
+      throw new Error(`edits[${index}]: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  })
+  const ordered = ranges.toSorted((a, b) => a.start - b.start || a.end - b.end)
+  for (let index = 1; index < ordered.length; index++) {
+    if (ordered[index].start < ordered[index - 1].end) {
+      throw new Error(`edits[${ordered[index].index}]: target overlaps edits[${ordered[index - 1].index}].`)
+    }
+  }
+  return ordered
+    .toReversed()
+    .reduce((result, edit) => result.slice(0, edit.start) + edit.newString + result.slice(edit.end), content)
+}
+
+function findUniqueMatch(content: string, oldString: string) {
+  const exact = content.indexOf(oldString)
+  if (exact !== -1) {
+    if (exact === content.lastIndexOf(oldString)) return oldString
+    throw new Error("Found multiple matches for oldString. Provide more surrounding context to make the match unique.")
+  }
+
+  const searches = new Set<string>()
+  const candidates = new Map<string, string>()
+  for (const replacer of [
+    LineTrimmedReplacer,
+    BlockAnchorReplacer,
+    WhitespaceNormalizedReplacer,
+    IndentationFlexibleReplacer,
+    EscapeNormalizedReplacer,
+    TrimmedBoundaryReplacer,
+    ContextAwareReplacer,
+  ]) {
+    for (const search of replacer(content, oldString)) {
+      if (search === "" || searches.has(search)) continue
+      searches.add(search)
+      if (isDisproportionateMatch(search, oldString)) {
+        throw new Error(
+          "Refusing replacement because the matched span is much larger than oldString. Re-read the file and provide the full exact oldString for the intended replacement.",
+        )
+      }
+      for (let start = content.indexOf(search); start !== -1; start = content.indexOf(search, start + search.length)) {
+        candidates.set(`${start}:${start + search.length}`, search)
+      }
+    }
+  }
+  if (candidates.size === 1) return candidates.values().next().value!
+  if (candidates.size === 0) {
+    throw new Error(
+      "Could not find oldString in the file. It must match exactly, including whitespace, indentation, and line endings.",
+    )
+  }
+  throw new Error(
+    "Found multiple fuzzy matches for oldString. Provide more surrounding context to make the match unique.",
+  )
 }
 
 function isDisproportionateMatch(search: string, oldString: string) {

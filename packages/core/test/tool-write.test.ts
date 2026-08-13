@@ -2,7 +2,7 @@ import fs from "fs/promises"
 import path from "path"
 import { fileURLToPath } from "url"
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer } from "effect"
+import { Deferred, Effect, Fiber, Layer } from "effect"
 import { FileMutation } from "@opencode-ai/core/file-mutation"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -15,6 +15,7 @@ import { SessionV2 } from "@opencode-ai/core/session"
 import { ToolRegistry } from "@opencode-ai/core/tool/registry"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { WriteTool } from "@opencode-ai/core/tool/write"
+import { SessionReadReceipt } from "@opencode-ai/core/session/read-receipt"
 import { location } from "./fixture/location"
 import { tmpdir } from "./fixture/tmpdir"
 import { testEffect } from "./lib/effect"
@@ -24,6 +25,14 @@ const sessionID = SessionV2.ID.make("ses_write_tool_test")
 const assertions: PermissionV2.AssertInput[] = []
 const writes: string[] = []
 let denyAction: string | undefined
+let receiptMatches = true
+const receipts = Layer.mock(SessionReadReceipt.Service, {
+  get: () => Effect.succeed(undefined),
+  match: () => Effect.succeed(receiptMatches),
+  upsert: () => Effect.die("unused"),
+  invalidate: () => Effect.succeed(true),
+  clear: () => Effect.succeed(0),
+})
 
 const permission = Layer.succeed(
   PermissionV2.Service,
@@ -46,6 +55,7 @@ const reset = () => {
   assertions.length = 0
   writes.length = 0
   denyAction = undefined
+  receiptMatches = true
 }
 
 const filesystem = Layer.effect(
@@ -56,6 +66,8 @@ const filesystem = Layer.effect(
       ...fs,
       writeWithDirs: (target, content, mode) =>
         Effect.sync(() => writes.push(target)).pipe(Effect.andThen(fs.writeWithDirs(target, content, mode))),
+      writeFileString: (target, content, options) =>
+        Effect.sync(() => writes.push(target)).pipe(Effect.andThen(fs.writeFileString(target, content, options))),
     })
   }),
 ).pipe(Layer.provide(LayerNode.compile(FSUtil.node)))
@@ -82,6 +94,7 @@ const withTool = <A, E, R>(directory: string, body: (registry: ToolRegistry.Inte
           [Location.node, activeLocation],
           [PermissionV2.node, permission],
           [ToolOutputStore.node, ToolOutputStore.nodeWithoutConfig],
+          [SessionReadReceipt.node, receipts],
         ],
       ),
     ),
@@ -106,7 +119,7 @@ describe("WriteTool", () => {
           Effect.gen(function* () {
             expect((yield* toolDefinitions(registry)).map((tool) => tool.name)).toEqual(["write"])
             const settled = yield* settleTool(registry, call({ path: "src/new.txt", content: "created" }))
-            expect(settled).toEqual({
+            expect(settled).toMatchObject({
               result: { type: "text", value: "Created file successfully: src/new.txt" },
               output: {
                 structured: {
@@ -122,8 +135,68 @@ describe("WriteTool", () => {
               "created",
             )
             expect(assertions).toMatchObject([{ sessionID, action: "edit", resources: ["src/new.txt"], save: ["*"] }])
-            expect(writes).toEqual([path.join(yield* Effect.promise(() => fs.realpath(tmp.path)), "src", "new.txt")])
+            expect(new Set(writes)).toEqual(
+              new Set([path.join(yield* Effect.promise(() => fs.realpath(tmp.path)), "src", "new.txt")]),
+            )
+            yield* Effect.forEach(settled.releases ?? [], (release) => release(), { discard: true })
           }),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("retains the file lock until durable settlement releases it", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        return withTool(tmp.path, (registry) =>
+          Effect.gen(function* () {
+            const settled = yield* settleTool(registry, call({ path: "locked.txt", content: "first" }))
+            const entered = yield* Deferred.make<void>()
+            const files = yield* FileMutation.Service
+            const target = yield* (yield* LocationMutation.Service).resolve({ path: "locked.txt" })
+            const second = yield* files.write({ target, content: "second" }).pipe(
+              Effect.tap(() => Deferred.succeed(entered, undefined)),
+              Effect.forkChild,
+            )
+            yield* Effect.yieldNow
+            expect(yield* Deferred.isDone(entered)).toBeFalse()
+
+            yield* Effect.forEach(settled.releases ?? [], (release) => release(), { discard: true })
+            yield* Deferred.await(entered)
+            yield* Fiber.join(second)
+            expect(yield* Effect.promise(() => fs.readFile(target.canonical, "utf8"))).toBe("second")
+          }),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("creates unread targets but rejects unread existing targets", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        receiptMatches = false
+        const existing = path.join(tmp.path, "existing.txt")
+        return Effect.promise(() => fs.writeFile(existing, "before")).pipe(
+          Effect.andThen(
+            withTool(tmp.path, (registry) =>
+              Effect.gen(function* () {
+                expect(yield* executeTool(registry, call({ path: "new.txt", content: "created" }))).toMatchObject({
+                  type: "text",
+                })
+                expect(yield* executeTool(registry, call({ path: "existing.txt", content: "after" }))).toEqual({
+                  type: "error",
+                  value: "Unable to write existing.txt",
+                })
+                expect(yield* Effect.promise(() => fs.readFile(existing, "utf8"))).toBe("before")
+              }),
+            ),
+          ),
         )
       },
       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),

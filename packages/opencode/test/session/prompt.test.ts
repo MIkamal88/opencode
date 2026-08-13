@@ -239,6 +239,22 @@ function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[
   return makePrompt(input)
 }
 
+const failingAfterPlugin = Layer.mock(Plugin.Service, {
+  trigger: <Name extends string, Input, Output>(name: Name, _input: Input, output: Output) =>
+    name === "tool.execute.after" ? Effect.die(new Error("injected after-hook failure")) : Effect.succeed(output),
+  list: () => Effect.succeed([]),
+  init: () => Effect.void,
+})
+const failingAfter = testEffect(
+  LayerNode.compile(LayerNode.group([promptRoot, testLLMServerNode]), [
+    [SessionSummary.node, summary],
+    [LSP.node, lsp],
+    [MCP.node, makeMcp()],
+    [RuntimeFlags.node, runtimeFlags],
+    [Plugin.node, failingAfterPlugin],
+  ]),
+)
+
 const it = testEffect(makeHttp())
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
@@ -254,6 +270,7 @@ const withMcpInstructions = testEffect(
   }),
 )
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
+const unixFailingAfter = process.platform !== "win32" ? failingAfter.instance : failingAfter.instance.skip
 const unixNoLLMServer = process.platform !== "win32" ? noLLMServer.instance : noLLMServer.instance.skip
 
 // Config that registers a custom "test" provider with a "test-model" model
@@ -1951,6 +1968,45 @@ unix(
       expect(tool.state.output).toMatch(/\.\.\.output truncated\.\.\./)
       expect(tool.state.output).toMatch(/Full output saved to:\s+\S+/)
       expect(tool.state.output).not.toContain("Tool execution aborted")
+    }),
+  { git: true },
+  30_000,
+)
+
+unixFailingAfter(
+  "discard truncated shell output when the post-execution hook fails",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const fs = yield* FSUtil.Service
+      const before = new Set(yield* fs.readDirectory(Truncate.DIR).pipe(Effect.catch(() => Effect.succeed([]))))
+      const chat = yield* sessions.create({
+        title: "Shell post-hook failure",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "run bash" }],
+      })
+      yield* llm.tool("bash", {
+        command:
+          'i=0; while [ "$i" -lt 4000 ]; do printf "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx %05d\\n" "$i"; i=$((i + 1)); done',
+        timeout: 30_000,
+      })
+
+      yield* prompt.loop({ sessionID: chat.id })
+      const messages = yield* MessageV2.filterCompactedEffect(chat.id)
+      const tool = messages
+        .flatMap((message) => message.parts)
+        .find((part): part is ErrorToolPart => part.type === "tool" && part.state.status === "error")
+      const after = yield* fs.readDirectory(Truncate.DIR).pipe(Effect.catch(() => Effect.succeed([])))
+
+      expect(tool?.state.error).toContain("injected after-hook failure")
+      expect(after.filter((entry) => !before.has(entry))).toEqual([])
     }),
   { git: true },
   30_000,

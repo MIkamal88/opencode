@@ -8,6 +8,7 @@ import { evaluate } from "@/permission/evaluate"
 import { Config } from "@/config/config"
 import { ToolID } from "./schema"
 import { TRUNCATION_DIR } from "./truncation-dir"
+import { open } from "node:fs/promises"
 
 const RETENTION = Duration.days(7)
 
@@ -17,6 +18,11 @@ export const DIR = TRUNCATION_DIR
 export const GLOB = path.join(TRUNCATION_DIR, "*")
 
 export type Result = { content: string; truncated: false } | { content: string; truncated: true; outputPath: string }
+
+export interface Ownership {
+  readonly retain: () => Effect.Effect<void>
+  readonly discard: () => Effect.Effect<void>
+}
 
 export interface Options {
   maxLines?: number
@@ -31,12 +37,14 @@ function hasTaskTool(agent?: Agent.Info) {
 
 export interface Interface {
   readonly cleanup: () => Effect.Effect<void>
-  readonly write: (text: string) => Effect.Effect<string>
+  readonly write: (content: string | Uint8Array) => Effect.Effect<string>
   /**
    * Returns output unchanged when it fits within the limits, otherwise writes the full text
    * to the truncation directory and returns a preview plus a hint to inspect the saved file.
    */
   readonly output: (text: string, options?: Options, agent?: Agent.Info) => Effect.Effect<Result>
+  /** Private settlement ownership for a newly written truncation artifact. */
+  readonly ownership: (outputPath: string) => Ownership
   /**
    * Resolved truncation limits: values from `tool_output` in opencode config, or MAX_LINES / MAX_BYTES if unset.
    */
@@ -65,10 +73,18 @@ const layer = Layer.effect(
       }
     })
 
-    const write = Effect.fn("Truncate.write")(function* (text: string) {
+    const write = Effect.fn("Truncate.write")(function* (content: string | Uint8Array) {
       const file = path.join(TRUNCATION_DIR, ToolID.ascending())
       yield* fs.ensureDir(TRUNCATION_DIR).pipe(Effect.orDie)
-      yield* fs.writeFileString(file, text).pipe(Effect.orDie)
+      if (process.platform !== "win32") yield* fs.chmod(TRUNCATION_DIR, 0o700).pipe(Effect.orDie)
+      yield* Effect.acquireUseRelease(
+        Effect.tryPromise(() => open(file, "wx", process.platform === "win32" ? undefined : 0o600)),
+        (handle) => Effect.tryPromise(() => handle.writeFile(content)),
+        (handle) => Effect.tryPromise(() => handle.close()).pipe(Effect.ignore),
+      ).pipe(
+        Effect.onError(() => fs.remove(file).pipe(Effect.ignore)),
+        Effect.orDie,
+      )
       return file
     })
 
@@ -140,6 +156,22 @@ const layer = Layer.effect(
       } as const
     })
 
+    const ownership = (outputPath: string): Ownership => {
+      let settled: "retained" | "discarded" | undefined
+      return {
+        retain: () =>
+          Effect.sync(() => {
+            if (!settled) settled = "retained"
+          }),
+        discard: () =>
+          Effect.suspend(() => {
+            if (settled) return Effect.void
+            settled = "discarded"
+            return fs.remove(outputPath).pipe(Effect.ignore)
+          }),
+      }
+    }
+
     yield* cleanup().pipe(
       Effect.catchCause((cause) => Effect.logError("truncation cleanup failed", { cause: Cause.pretty(cause) })),
       Effect.repeat(Schedule.spaced(Duration.hours(1))),
@@ -147,7 +179,7 @@ const layer = Layer.effect(
       Effect.forkScoped,
     )
 
-    return Service.of({ cleanup, write, output, limits })
+    return Service.of({ cleanup, write, output, ownership, limits })
   }),
 )
 

@@ -230,6 +230,26 @@ describe("Truncate", () => {
       }),
     )
 
+    it.live("settles artifact ownership idempotently", () =>
+      Effect.gen(function* () {
+        const svc = yield* Truncate.Service
+        const fs = yield* FSUtil.Service
+        const discarded = yield* svc.write("discarded")
+        const retained = yield* svc.write("retained")
+        const discard = svc.ownership(discarded)
+        const retain = svc.ownership(retained)
+
+        yield* discard.discard()
+        yield* discard.discard()
+        yield* retain.retain()
+        yield* retain.discard()
+
+        expect(yield* fs.existsSafe(discarded)).toBeFalse()
+        expect(yield* fs.existsSafe(retained)).toBeTrue()
+        yield* fs.remove(retained)
+      }),
+    )
+
     test("loads truncate effect in a fresh process", async () => {
       const out = await Process.run([process.execPath, "run", path.join(ROOT, "src", "tool", "truncate.ts")], {
         cwd: ROOT,

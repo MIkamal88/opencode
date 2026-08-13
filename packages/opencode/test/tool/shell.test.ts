@@ -1,13 +1,14 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Cause, Effect, Exit, Layer } from "effect"
 import type * as Scope from "effect/Scope"
 import os from "os"
 import path from "path"
+import { stat } from "node:fs/promises"
 import { Config } from "@/config/config"
 import { Shell } from "@opencode-ai/core/shell"
-import { ShellTool } from "../../src/tool/shell"
+import { ShellTool, writeAll } from "../../src/tool/shell"
 import { Filesystem } from "@/util/filesystem"
 import { provideInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
 import type { Permission } from "../../src/permission"
@@ -21,6 +22,7 @@ import { testEffect } from "../lib/effect"
 import { Tool } from "@/tool/tool"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { InstanceStore } from "@/project/instance-store"
+import type { FileHandle } from "node:fs/promises"
 
 const shellLayer = Layer.mergeAll(
   LayerNode.compile(
@@ -908,6 +910,65 @@ describe("tool.shell permissions", () => {
     }),
   )
 
+  if (process.platform !== "win32") {
+    for (const command of [
+      (file: string) => `printf x > ${quote(file)}`,
+      (file: string) => `tee ${quote(file)}`,
+      (file: string) => `dd of=${quote(file)}`,
+    ]) {
+      it.live(`asks for external_directory before executing ${command("/external/file").split(" ")[0]}`, () =>
+        Effect.gen(function* () {
+          const project = yield* tmpdirScoped()
+          const external = yield* tmpdirScoped()
+          const file = path.join(external, "file")
+          const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+          const stop = new Error("stop before execution")
+
+          yield* runIn(
+            project,
+            Effect.gen(function* () {
+              expect(yield* fail({ command: command(file) }, capture(requests, stop))).toMatchObject({
+                message: stop.message,
+              })
+            }),
+          )
+
+          expect(requests[0]).toMatchObject({
+            permission: "external_directory",
+            patterns: [glob(path.join(external, "*"))],
+          })
+          expect(yield* Effect.promise(() => Bun.file(file).exists())).toBe(false)
+        }),
+      )
+    }
+
+    it.live("asks for external_directory for path-shaped interpreter scripts", () =>
+      Effect.gen(function* () {
+        const project = yield* tmpdirScoped()
+        const external = yield* tmpdirScoped()
+        const script = path.join(external, "script.py")
+        const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+        const stop = new Error("stop before execution")
+        expect(
+          yield* runIn(project, fail({ command: `python ${quote(script)}` }, capture(requests, stop))),
+        ).toMatchObject({ message: stop.message })
+        expect(requests[0]).toMatchObject({
+          permission: "external_directory",
+          patterns: [glob(path.join(external, "*"))],
+        })
+      }),
+    )
+
+    it.live("does not treat ordinary command words as file paths", () =>
+      Effect.gen(function* () {
+        const project = yield* tmpdirScoped()
+        const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+        yield* runIn(project, run({ command: "printf ordinary words" }, capture(requests)))
+        expect(requests.some((request) => request.permission === "external_directory")).toBe(false)
+      }),
+    )
+  }
+
   each("does not ask for external_directory permission when rm inside project", () =>
     Effect.gen(function* () {
       const tmp = yield* tmpdirScoped()
@@ -1034,6 +1095,7 @@ describe("tool.shell abort", () => {
           )
           expect(res.output).toContain("before")
           expect(res.output).toContain("User aborted the command")
+          expect(res.metadata.exit).toBeNull()
           expect(collected.length).toBeGreaterThan(0)
         }),
       ),
@@ -1052,6 +1114,7 @@ describe("tool.shell abort", () => {
           })
           expect(result.output).toContain("shell tool terminated command after exceeding timeout")
           expect(result.output).toContain("retry with a larger timeout value in milliseconds")
+          expect(result.metadata.exit).toBeNull()
         }),
       ),
     15_000,
@@ -1132,34 +1195,46 @@ describe("tool.shell abort", () => {
 })
 
 describe("tool.shell truncation", () => {
-  it.live("truncates output exceeding line limit", () =>
-    runIn(
-      projectRoot,
-      Effect.gen(function* () {
-        const lineCount = Truncate.MAX_LINES + 500
-        const result = yield* run({
-          command: fill("lines", lineCount),
-        })
-        mustTruncate(result)
-        expect(result.output).toMatch(/\.\.\.output truncated\.\.\./)
-        expect(result.output).toMatch(/Full output saved to:\s+\S+/)
-      }),
-    ),
+  it.live(
+    "truncates output exceeding line limit",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const lineCount = Truncate.MAX_LINES + 500
+          const result = yield* run({
+            command: fill("lines", lineCount),
+          })
+          mustTruncate(result)
+          expect(result.output).toMatch(/\.\.\.output truncated\.\.\./)
+          expect(result.output).toMatch(/Full output saved to:\s+\S+/)
+          expect(result.output).toContain(`of ${lineCount} (`)
+          expect(result.output).toContain("Use grep with path")
+          expect(result.output).toContain("or read with filePath")
+          expect(result.output).toContain("offset 501, and limit 2000")
+          expect(result.output).not.toContain("\n1\n")
+          expect(result.output).toContain(`\n${lineCount}\n`)
+        }),
+      ),
+    30_000,
   )
 
-  it.live("truncates output exceeding byte limit", () =>
-    runIn(
-      projectRoot,
-      Effect.gen(function* () {
-        const byteCount = Truncate.MAX_BYTES + 10000
-        const result = yield* run({
-          command: fill("bytes", byteCount),
-        })
-        mustTruncate(result)
-        expect(result.output).toMatch(/\.\.\.output truncated\.\.\./)
-        expect(result.output).toMatch(/Full output saved to:\s+\S+/)
-      }),
-    ),
+  it.live(
+    "truncates output exceeding byte limit",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const byteCount = Truncate.MAX_BYTES + 10000
+          const result = yield* run({
+            command: fill("bytes", byteCount),
+          })
+          mustTruncate(result)
+          expect(result.output).toMatch(/\.\.\.output truncated\.\.\./)
+          expect(result.output).toMatch(/Full output saved to:\s+\S+/)
+        }),
+      ),
+    30_000,
   )
 
   it.live("does not truncate small output", () =>
@@ -1193,7 +1268,205 @@ describe("tool.shell truncation", () => {
         expect(lines.length).toBe(lineCount)
         expect(lines[0]).toBe("1")
         expect(lines[lineCount - 1]).toBe(String(lineCount))
+        if (process.platform !== "win32") {
+          expect((yield* Effect.promise(() => stat(filepath!))).mode & 0o777).toBe(0o600)
+          expect((yield* Effect.promise(() => stat(path.dirname(filepath!)))).mode & 0o777).toBe(0o700)
+        }
       }),
     ),
+  )
+
+  it.live("preserves split UTF-8, long lines, and late output", () =>
+    runIn(
+      projectRoot,
+      Effect.gen(function* () {
+        const updates: string[] = []
+        const code =
+          'const b=Buffer.from("🙂");process.stdout.write("x".repeat(60000));process.stdout.write(b.subarray(0,2));setTimeout(()=>{process.stdout.write(b.subarray(2));process.stdout.write("LATE")},10)'
+        const result = yield* run(
+          { command: `${bin} -e ${evalarg(code)}` },
+          {
+            ...ctx,
+            metadata: (input) =>
+              Effect.sync(() => {
+                const output = (input.metadata as { output?: string }).output
+                if (output) updates.push(output)
+              }),
+          },
+        )
+        mustTruncate(result)
+        expect(result.metadata.exit).toBe(0)
+        expect(result.output).toContain("🙂LATE")
+        expect(result.output).not.toContain("�")
+        expect(updates.join("")).not.toContain("�")
+
+        const filepath = (result.metadata as { outputPath?: string }).outputPath
+        expect(filepath).toBeTruthy()
+        expect(yield* (yield* FSUtil.Service).readFileString(filepath!)).toBe("x".repeat(60000) + "🙂LATE")
+        expect(result.output).toContain("Showing the last 51200 bytes of 60008 bytes (1 lines total)")
+      }),
+    ),
+  )
+
+  if (process.platform !== "win32") {
+    it.live(
+      "cleans up descendants after root exit",
+      () =>
+        Effect.gen(function* () {
+          const tmp = yield* tmpdirScoped()
+          yield* runIn(
+            tmp,
+            Effect.gen(function* () {
+              const marker = path.join(tmp, "late")
+              const started = Date.now()
+              const result = yield* run({ command: `(sleep 2; printf late > ${quote(marker)}) & printf root-done` })
+              expect(result.metadata.exit).toBe(0)
+              expect(result.output).toContain("root-done")
+              expect(Date.now() - started).toBeLessThan(5_000)
+              yield* Effect.sleep("2500 millis")
+              expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+            }),
+          )
+        }),
+      15_000,
+    )
+
+    it.live("finalizes truncated artifacts after descendant cleanup", () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const result = yield* run({
+            command: `(sleep 2; printf late) & ${fill("bytes", Truncate.MAX_BYTES + 1)}`,
+          })
+          mustTruncate(result)
+          expect(result.metadata.exit).toBe(0)
+          const filepath = (result.metadata as { outputPath?: string }).outputPath
+          expect(filepath).toBeTruthy()
+          const artifact = yield* (yield* FSUtil.Service).readFileString(filepath!)
+          expect(artifact.replace("late", "")).toBe("a".repeat(Truncate.MAX_BYTES + 1))
+        }),
+      ),
+    )
+  }
+
+  it.live(
+    "preserves invalid and incomplete UTF-8 bytes in artifact",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const expected = Buffer.concat([Buffer.alloc(17_067, 255), Buffer.from([240, 159])])
+          const code = "process.stdout.write(Buffer.concat([Buffer.alloc(17067,255),Buffer.from([240,159])]))"
+          const result = yield* run({ command: `${bin} -e ${evalarg(code)}`, timeout: 15_000 })
+          mustTruncate(result)
+          expect(result.output).toContain("�")
+          expect(result.output).toContain(`from ${expected.length} raw bytes`)
+          expect(result.output).toContain("invalid or incomplete UTF-8 is replaced for display")
+          expect(result.output).toContain("saved file contains the exact raw bytes")
+          expect(expected.byteLength).toBeLessThan(Truncate.MAX_BYTES)
+          const filepath = (result.metadata as { outputPath?: string }).outputPath
+          expect(filepath).toBeTruthy()
+          expect(Buffer.from(yield* (yield* FSUtil.Service).readFile(filepath!))).toEqual(expected)
+        }),
+      ),
+    20_000,
+  )
+
+  for (const item of shells) {
+    it.live(
+      `preserves status and complete artifacts [${item.label}]`,
+      () =>
+        withShell(
+          item,
+          runIn(
+            projectRoot,
+            Effect.gen(function* () {
+              const marker = "artifact-status-end"
+              const result = yield* run({
+                command: `${fill("bytes", Truncate.MAX_BYTES + 1)}; ${bin} -e ${evalarg(`process.stdout.write(${JSON.stringify(marker)});process.exit(7)`)}`,
+                timeout: 15_000,
+              })
+              mustTruncate(result)
+              expect(result.metadata.exit).toBe(7)
+              const filepath = (result.metadata as { outputPath?: string }).outputPath
+              expect(filepath).toBeTruthy()
+              expect(yield* (yield* FSUtil.Service).readFileString(filepath!)).toEndWith(marker)
+            }),
+          ),
+        ),
+      30_000,
+    )
+  }
+
+  it.live(
+    "preserves complete artifact on timeout",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const marker = "timeout-artifact-end"
+          const code = `process.stdout.write("x".repeat(60000)+${JSON.stringify(marker)});setTimeout(()=>{},30000)`
+          const result = yield* run({ command: `${bin} -e ${evalarg(code)}`, timeout: 2_000 })
+          mustTruncate(result)
+          expect(result.metadata.exit).toBeNull()
+          expect(result.output).toContain("shell tool terminated command")
+          const filepath = (result.metadata as { outputPath?: string }).outputPath
+          expect(filepath).toBeTruthy()
+          expect(yield* (yield* FSUtil.Service).readFileString(filepath!)).toBe("x".repeat(60000) + marker)
+        }),
+      ),
+    15_000,
+  )
+
+  it.live(
+    "preserves complete artifact when aborted",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const marker = "abort-artifact-end"
+          const controller = new AbortController()
+          const code = `process.stdout.write("x".repeat(60000)+${JSON.stringify(marker)});setTimeout(()=>{},30000)`
+          const result = yield* run(
+            { command: `${bin} -e ${evalarg(code)}` },
+            {
+              ...ctx,
+              abort: controller.signal,
+              metadata: (input) => {
+                const output = (input.metadata as { output?: string }).output
+                if (output?.includes(marker)) controller.abort()
+                return Effect.void
+              },
+            },
+          )
+          mustTruncate(result)
+          expect(result.metadata.exit).toBeNull()
+          expect(result.output).toContain("User aborted the command")
+          const filepath = (result.metadata as { outputPath?: string }).outputPath
+          expect(filepath).toBeTruthy()
+          expect(yield* (yield* FSUtil.Service).readFileString(filepath!)).toBe("x".repeat(60000) + marker)
+        }),
+      ),
+    15_000,
+  )
+})
+
+test("shell artifact writer retries short writes and rejects zero progress", async () => {
+  const written: Uint8Array[] = []
+  const short = {
+    write: async (buffer: Uint8Array, offset: number, length: number) => {
+      const bytesWritten = Math.min(2, length)
+      written.push(buffer.slice(offset, offset + bytesWritten))
+      return { bytesWritten, buffer }
+    },
+  } as unknown as FileHandle
+  await Effect.runPromise(writeAll(short, Buffer.from("abcdef")))
+  expect(Buffer.concat(written)).toEqual(Buffer.from("abcdef"))
+
+  const stalled = {
+    write: async (buffer: Uint8Array) => ({ bytesWritten: 0, buffer }),
+  } as unknown as FileHandle
+  await expect(Effect.runPromise(writeAll(stalled, Buffer.from("x")))).rejects.toThrow(
+    "Shell output artifact write made no progress",
   )
 })

@@ -23,6 +23,9 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { isRecord } from "@/util/record"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { SessionReadReceipt } from "@opencode-ai/core/session/read-receipt"
+import { AbsolutePath } from "@opencode-ai/core/schema"
+import { SessionSchema } from "@opencode-ai/core/session/schema"
 
 const MCP_RESOURCE_TOOLS = {
   list: "list_mcp_resources",
@@ -42,10 +45,11 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   agent: Agent.Info
   model: Provider.Model
   session: Session.Info
-  processor: Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
+  processor: Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "ownToolCall" | "completeToolCall">
   bypassAgentCheck: boolean
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
+  receipts: SessionReadReceipt.Interface
 }) {
   const tools: Record<string, AITool> = {}
   const run = yield* EffectBridge.make()
@@ -55,39 +59,80 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   const mcp = yield* MCP.Service
   const truncate = yield* Truncate.Service
   const flags = yield* RuntimeFlags.Service
+  const receipts = input.receipts
 
-  const context = (args: Record<string, unknown>, options: ToolExecutionOptions): Tool.Context => ({
-    sessionID: input.session.id,
-    abort: options.abortSignal!,
-    messageID: input.processor.message.id,
-    callID: options.toolCallId,
-    extra: { model: input.model, bypassAgentCheck: input.bypassAgentCheck, promptOps: input.promptOps },
-    agent: input.agent.name,
-    messages: input.messages,
-    metadata: (val) =>
-      input.processor.updateToolCall(options.toolCallId, (match) => {
-        if (!["running", "pending"].includes(match.state.status)) return match
-        return {
-          ...match,
-          state: {
-            title: val.title,
-            metadata: val.metadata,
-            status: "running",
-            input: args,
-            time: { start: Date.now() },
-          },
-        }
-      }),
-    ask: (req) =>
-      permission
-        .ask({
-          ...req,
-          sessionID: input.session.id,
-          tool: { messageID: input.processor.message.id, callID: options.toolCallId },
-          ruleset: Permission.merge(input.agent.permission, input.session.permission ?? []),
-        })
-        .pipe(Effect.orDie),
+  const transferOwnership = Effect.fnUntraced(function* (toolCallID: string, result: object) {
+    const ownership = Tool.takeOwnership(result)
+    if (ownership) yield* input.processor.ownToolCall(toolCallID, ownership)
   })
+
+  const truncateOwned = <A extends object>(toolCallID: string, content: string, make: (result: Truncate.Result) => A) =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const truncated = yield* truncate.output(content, {}, input.agent)
+        const output = make(truncated)
+        if (truncated.truncated) Tool.attachOwnership(output, truncate.ownership(truncated.outputPath))
+        yield* transferOwnership(toolCallID, output)
+        return output
+      }),
+    )
+
+  const context = (args: Record<string, unknown>, options: ToolExecutionOptions): Tool.Context => {
+    const receipt = {
+      value: undefined as { canonicalPath: string; digest: string; release?: () => Effect.Effect<void> } | undefined,
+    }
+    return {
+      sessionID: input.session.id,
+      abort: options.abortSignal!,
+      messageID: input.processor.message.id,
+      callID: options.toolCallId,
+      extra: { model: input.model, bypassAgentCheck: input.bypassAgentCheck, promptOps: input.promptOps },
+      agent: input.agent.name,
+      messages: input.messages,
+      metadata: (val) =>
+        input.processor.updateToolCall(options.toolCallId, (match) => {
+          if (!["running", "pending"].includes(match.state.status)) return match
+          return {
+            ...match,
+            state: {
+              title: val.title,
+              metadata: val.metadata,
+              status: "running",
+              input: args,
+              time: { start: Date.now() },
+            },
+          }
+        }),
+      ask: (req) =>
+        permission
+          .ask({
+            ...req,
+            sessionID: input.session.id,
+            tool: { messageID: input.processor.message.id, callID: options.toolCallId },
+            ruleset: Permission.merge(input.agent.permission, input.session.permission ?? []),
+          })
+          .pipe(Effect.orDie),
+      receipt: {
+        match: (receiptInput) =>
+          receipts
+            .match({
+              sessionID: SessionSchema.ID.make(input.session.id),
+              canonicalPath: AbsolutePath.make(receiptInput.canonicalPath),
+              digest: receiptInput.digest,
+            })
+            .pipe(Effect.orDie),
+        invalidate: (receiptInput) =>
+          receipts
+            .invalidate({
+              sessionID: SessionSchema.ID.make(input.session.id),
+              canonicalPath: AbsolutePath.make(receiptInput.canonicalPath),
+            })
+            .pipe(Effect.orDie, Effect.asVoid),
+        settle: (receiptInput) => Effect.sync(() => void (receipt.value = receiptInput)),
+        pending: () => receipt.value,
+      },
+    }
+  }
 
   for (const item of yield* registry.tools({
     modelID: ModelV2.ID.make(input.model.api.id),
@@ -101,32 +146,53 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
       inputSchema: jsonSchema(schema),
       execute(args, options) {
         return run.promise(
-          Effect.gen(function* () {
+          Effect.uninterruptibleMask((restore) => {
             const ctx = context(args, options)
-            yield* plugin.trigger(
-              "tool.execute.before",
-              { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
-              { args },
-            )
-            const result = yield* item.execute(args, ctx)
-            const output = {
-              ...result,
-              attachments: result.attachments?.map((attachment) => ({
-                ...attachment,
-                id: PartID.ascending(),
-                sessionID: ctx.sessionID,
-                messageID: input.processor.message.id,
-              })),
-            }
-            yield* plugin.trigger(
-              "tool.execute.after",
-              { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args },
-              output,
-            )
-            if (options.abortSignal?.aborted) {
-              yield* input.processor.completeToolCall(options.toolCallId, output)
-            }
-            return output
+            return Effect.gen(function* () {
+              yield* restore(
+                plugin.trigger(
+                  "tool.execute.before",
+                  { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
+                  { args },
+                ),
+              )
+              const result = yield* restore(item.execute(args, ctx))
+              yield* transferOwnership(options.toolCallId, result)
+              const output = {
+                ...result,
+                attachments: result.attachments?.map((attachment) => ({
+                  ...attachment,
+                  id: PartID.ascending(),
+                  sessionID: ctx.sessionID,
+                  messageID: input.processor.message.id,
+                })),
+              }
+              yield* restore(
+                plugin.trigger(
+                  "tool.execute.after",
+                  { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args },
+                  output,
+                ),
+              )
+              const pending = ctx.receipt?.pending()
+              if (pending || options.abortSignal?.aborted) {
+                yield* input.processor.completeToolCall(
+                  options.toolCallId,
+                  output,
+                  pending
+                    ? (seq, client) =>
+                        SessionReadReceipt.upsertIn(client, {
+                          sessionID: SessionSchema.ID.make(ctx.sessionID),
+                          canonicalPath: AbsolutePath.make(pending.canonicalPath),
+                          digest: pending.digest,
+                          settledSeq: seq,
+                          callID: ctx.callID,
+                        }).pipe(Effect.orDie, Effect.asVoid)
+                    : undefined,
+                )
+              }
+              return output
+            }).pipe(Effect.ensuring(Effect.suspend(() => ctx.receipt?.pending()?.release?.() ?? Effect.void)))
           }),
         )
       },
@@ -193,8 +259,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 ),
               )
             const content = JSON.stringify({ resources: filtered.map(formatMcpResource) }, null, 2)
-            const truncated = yield* truncate.output(content, {}, input.agent)
-            const output = {
+            const output = yield* truncateOwned(opts.toolCallId, content, (truncated) => ({
               title: parsed.server ? `MCP resources: ${parsed.server}` : "MCP resources",
               metadata: {
                 count: filtered.length,
@@ -204,7 +269,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 ...(truncated.truncated && { outputPath: truncated.outputPath }),
               },
               output: truncated.content,
-            }
+            }))
             yield* plugin.trigger(
               "tool.execute.after",
               { tool: MCP_RESOURCE_TOOLS.list, sessionID: ctx.sessionID, callID: opts.toolCallId, args },
@@ -276,8 +341,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 ),
               )
             const content = JSON.stringify({ resourceTemplates: filtered.map(formatMcpResourceTemplate) }, null, 2)
-            const truncated = yield* truncate.output(content, {}, input.agent)
-            const output = {
+            const output = yield* truncateOwned(opts.toolCallId, content, (truncated) => ({
               title: parsed.server ? `MCP resource templates: ${parsed.server}` : "MCP resource templates",
               metadata: {
                 count: filtered.length,
@@ -287,7 +351,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 ...(truncated.truncated && { outputPath: truncated.outputPath }),
               },
               output: truncated.content,
-            }
+            }))
             yield* plugin.trigger(
               "tool.execute.after",
               { tool: MCP_RESOURCE_TOOLS.listTemplates, sessionID: ctx.sessionID, callID: opts.toolCallId, args },
@@ -351,8 +415,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             if (!content) throw new Error(`Failed to read MCP resource: ${parsed.server}/${parsed.uri}`)
 
             const formatted = formatMcpResourceContent(parsed.server, parsed.uri, content)
-            const truncated = yield* truncate.output(formatted.text, {}, input.agent)
-            const output = {
+            const output = yield* truncateOwned(opts.toolCallId, formatted.text, (truncated) => ({
               title: `MCP resource: ${parsed.uri}`,
               metadata: {
                 server: parsed.server,
@@ -369,7 +432,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                 sessionID: ctx.sessionID,
                 messageID: input.processor.message.id,
               })),
-            }
+            }))
             yield* plugin.trigger(
               "tool.execute.after",
               { tool: MCP_RESOURCE_TOOLS.read, sessionID: ctx.sessionID, callID: opts.toolCallId, args },
@@ -461,16 +524,13 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             }
           }
 
-          const truncated = yield* truncate.output(textParts.join("\n\n"), {}, input.agent)
-          const metadata = {
-            ...result.metadata,
-            truncated: truncated.truncated,
-            ...(truncated.truncated && { outputPath: truncated.outputPath }),
-          }
-
-          const output = {
+          const output = yield* truncateOwned(opts.toolCallId, textParts.join("\n\n"), (truncated) => ({
             title: "",
-            metadata,
+            metadata: {
+              ...result.metadata,
+              truncated: truncated.truncated,
+              ...(truncated.truncated && { outputPath: truncated.outputPath }),
+            },
             output: truncated.content,
             attachments: attachments.map((attachment) => ({
               ...attachment,
@@ -479,7 +539,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               messageID: input.processor.message.id,
             })),
             content: result.content,
-          }
+          }))
           if (opts.abortSignal?.aborted) {
             yield* input.processor.completeToolCall(opts.toolCallId, output)
           }

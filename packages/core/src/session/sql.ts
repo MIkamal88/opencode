@@ -174,3 +174,19 @@ export const SessionContextEpochTable = sqliteTable("session_context_epoch", {
   snapshot: text({ mode: "json" }).notNull().$type<SystemContext.Snapshot>(),
   baseline_seq: integer().notNull(),
 })
+
+export const SessionReadReceiptTable = sqliteTable(
+  "session_read_receipt",
+  {
+    session_id: text()
+      .$type<SessionSchema.ID>()
+      .notNull()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    canonical_path: text().notNull(),
+    digest: text().notNull(),
+    settled_seq: integer().notNull(),
+    call_id: text(),
+    ...Timestamps,
+  },
+  (table) => [primaryKey({ columns: [table.session_id, table.canonical_path] })],
+)

@@ -9,6 +9,7 @@ import { Decimal } from "decimal.js"
 import type { ProviderMetadata, Usage } from "@opencode-ai/llm"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Database } from "@opencode-ai/core/database/database"
+import { EventV2 } from "@opencode-ai/core/event"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionV2 } from "@opencode-ai/core/session"
 import * as SessionExecutionLocal from "@opencode-ai/core/session/execution/local"
@@ -446,6 +447,7 @@ export interface Interface {
     sessionID: SessionID
     revert: Info["revert"]
     summary: Info["summary"]
+    commit?: NonNullable<EventV2.PublishOptions["commit"]>
   }) => Effect.Effect<void>
   readonly clearRevert: (sessionID: SessionID) => Effect.Effect<void>
   readonly setSummary: (input: { sessionID: SessionID; summary: Info["summary"] }) => Effect.Effect<void>
@@ -463,7 +465,10 @@ export interface Interface {
     messageID: MessageID
     partID: PartID
   }) => Effect.Effect<SessionV1.Part | undefined>
-  readonly updatePart: <T extends SessionV1.Part>(part: T) => Effect.Effect<T>
+  readonly updatePart: <T extends SessionV1.Part>(
+    part: T,
+    commit?: NonNullable<EventV2.PublishOptions["commit"]>,
+  ) => Effect.Effect<T>
   readonly updatePartDelta: (input: {
     sessionID: SessionID
     messageID: MessageID
@@ -639,13 +644,20 @@ const layer: Layer.Layer<
         return msg
       }).pipe(Effect.withSpan("Session.updateMessage"))
 
-    const updatePart = <T extends SessionV1.Part>(part: T): Effect.Effect<T> =>
+    const updatePart = <T extends SessionV1.Part>(
+      part: T,
+      commit?: NonNullable<EventV2.PublishOptions["commit"]>,
+    ): Effect.Effect<T> =>
       Effect.gen(function* () {
-        yield* events.publish(SessionV1.Event.PartUpdated, {
-          sessionID: part.sessionID,
-          part: structuredClone(part),
-          time: Date.now(),
-        })
+        yield* events.publish(
+          SessionV1.Event.PartUpdated,
+          {
+            sessionID: part.sessionID,
+            part: structuredClone(part),
+            time: Date.now(),
+          },
+          { commit },
+        )
         return part
       }).pipe(Effect.withSpan("Session.updatePart"))
 
@@ -738,7 +750,7 @@ const layer: Layer.Layer<
       return session
     })
 
-    const patch = (sessionID: SessionID, info: Patch) =>
+    const patch = (sessionID: SessionID, info: Patch, commit?: NonNullable<EventV2.PublishOptions["commit"]>) =>
       Effect.gen(function* () {
         const current = yield* get(sessionID)
         const next = {
@@ -750,7 +762,7 @@ const layer: Layer.Layer<
           revert: info.revert === null ? undefined : (info.revert ?? current.revert),
           permission: info.permission === null ? undefined : (info.permission ?? current.permission),
         } as Info
-        yield* events.publish(SessionV1.Event.Updated, { sessionID, info: next })
+        yield* events.publish(SessionV1.Event.Updated, { sessionID, info: next }, { commit })
       })
 
     const touch = Effect.fn("Session.touch")(function* (sessionID: SessionID) {
@@ -795,12 +807,17 @@ const layer: Layer.Layer<
       sessionID: SessionID
       revert: Info["revert"]
       summary: Info["summary"]
+      commit?: NonNullable<EventV2.PublishOptions["commit"]>
     }) {
-      yield* patch(input.sessionID, {
-        summary: input.summary,
-        time: { updated: Date.now() },
-        revert: input.revert,
-      }).pipe(Effect.orDie)
+      yield* patch(
+        input.sessionID,
+        {
+          summary: input.summary,
+          time: { updated: Date.now() },
+          revert: input.revert,
+        },
+        input.commit,
+      ).pipe(Effect.orDie)
     })
 
     const clearRevert = Effect.fn("Session.clearRevert")(function* (sessionID: SessionID) {

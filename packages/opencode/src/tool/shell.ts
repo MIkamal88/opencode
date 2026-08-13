@@ -1,6 +1,6 @@
-import { Effect, Stream } from "effect"
+import { Effect, Fiber, Stream } from "effect"
 import os from "os"
-import { createWriteStream } from "node:fs"
+import { open, type FileHandle } from "node:fs/promises"
 import * as Tool from "./tool"
 import path from "path"
 import { containsPath, type InstanceContext } from "../project/instance-context"
@@ -14,6 +14,7 @@ import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Shell } from "@opencode-ai/core/shell"
 import { ShellID } from "./shell/id"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 
 import * as Truncate from "./truncate"
 import { Plugin } from "@/plugin"
@@ -79,6 +80,20 @@ type Scan = {
 type Chunk = {
   text: string
   size: number
+}
+
+export function writeAll(file: FileHandle, bytes: Uint8Array) {
+  return Effect.tryPromise({
+    try: async () => {
+      let offset = 0
+      while (offset < bytes.byteLength) {
+        const result = await file.write(bytes, offset, bytes.byteLength - offset)
+        if (result.bytesWritten === 0) throw new Error("Shell output artifact write made no progress")
+        offset += result.bytesWritten
+      }
+    },
+    catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+  })
 }
 
 const resolveWasm = (asset: string) => {
@@ -185,6 +200,22 @@ function prefix(text: string) {
   return text.slice(0, match.index)
 }
 
+function pathShaped(text: string) {
+  const value = unquote(text)
+  return (
+    value === "~" ||
+    value.startsWith("~/") ||
+    value.startsWith("~\\") ||
+    value.startsWith("/") ||
+    value.startsWith("./") ||
+    value.startsWith(".\\") ||
+    value.startsWith("../") ||
+    value.startsWith("..\\") ||
+    value.startsWith("\\\\") ||
+    /^[A-Za-z]:[\\/]/.test(value)
+  )
+}
+
 function pathArgs(list: Part[], ps: boolean, cmd = false) {
   if (!ps) {
     return list
@@ -219,38 +250,59 @@ function pathArgs(list: Part[], ps: boolean, cmd = false) {
 
 function preview(text: string) {
   if (text.length <= MAX_METADATA_LENGTH) return text
-  return "...\n\n" + text.slice(-MAX_METADATA_LENGTH)
+  const start = text.length - MAX_METADATA_LENGTH
+  const safe =
+    start < text.length && text.charCodeAt(start) >= 0xdc00 && text.charCodeAt(start) <= 0xdfff ? start + 1 : start
+  return "...\n\n" + text.slice(safe)
 }
 
 function tail(text: string, maxLines: number, maxBytes: number) {
   const lines = text.split("\n")
+  const trailingNewline = text.endsWith("\n")
+  if (trailingNewline) lines.pop()
   if (lines.length <= maxLines && Buffer.byteLength(text, "utf-8") <= maxBytes) {
     return {
       text,
       cut: false,
+      kind: "lines" as const,
+      startLine: 1,
+      endLine: lines.length,
+      retainedBytes: Buffer.byteLength(text, "utf-8"),
     }
   }
 
   const out: string[] = []
-  let bytes = 0
+  let bytes = trailingNewline ? 1 : 0
   for (let i = lines.length - 1; i >= 0 && out.length < maxLines; i--) {
     const size = Buffer.byteLength(lines[i], "utf-8") + (out.length > 0 ? 1 : 0)
     if (bytes + size > maxBytes) {
       if (out.length === 0) {
         const buf = Buffer.from(lines[i], "utf-8")
-        let start = buf.length - maxBytes
+        let start = buf.length - (maxBytes - bytes)
         if (start < 0) start = 0
         while (start < buf.length && (buf[start] & 0xc0) === 0x80) start++
         out.unshift(buf.subarray(start).toString("utf-8"))
+        bytes += buf.length - start
       }
-      break
+      return {
+        text: out.join("\n") + (trailingNewline ? "\n" : ""),
+        cut: true,
+        kind: "bytes" as const,
+        startLine: lines.length - out.length + 1,
+        endLine: lines.length,
+        retainedBytes: bytes,
+      }
     }
     out.unshift(lines[i])
     bytes += size
   }
   return {
-    text: out.join("\n"),
+    text: out.join("\n") + (trailingNewline ? "\n" : ""),
     cut: true,
+    kind: "lines" as const,
+    startLine: lines.length - out.length + 1,
+    endLine: lines.length,
+    retainedBytes: bytes,
   }
 }
 
@@ -389,20 +441,43 @@ export const ShellTool = Tool.define(
       }
       const shellKind = ShellID.toKind(Shell.name(shell))
 
+      const inspect = Effect.fnUntraced(function* (arg: string) {
+        const resolved = yield* argPath(arg, cwd, ps, shell)
+        yield* Effect.logInfo("resolved path", { arg, resolved })
+        if (!resolved || containsPath(resolved, instance)) return
+        const dir = (yield* fs.isDir(resolved)) ? resolved : path.dirname(resolved)
+        scan.dirs.add(dir)
+      })
+
+      for (const redirect of root.descendantsOfType("file_redirect")) {
+        const destination = redirect?.childForFieldName("destination")
+        if (destination) yield* inspect(destination.text)
+      }
+
       for (const node of commands(root)) {
         const command = parts(node)
         const tokens = command.map((item) => item.text)
         const cmd = ps || shellKind === "cmd" ? tokens[0]?.toLowerCase() : tokens[0]
 
+        const candidates = new Set(
+          command
+            .slice(1)
+            .filter((item) => pathShaped(item.text))
+            .map((item) => item.text),
+        )
+
         if (cmd && (FILES.has(cmd) || (shellKind === "cmd" && CMD_FILES.has(cmd)))) {
-          for (const arg of pathArgs(command, ps, shellKind === "cmd")) {
-            const resolved = yield* argPath(arg, cwd, ps, shell)
-            yield* Effect.logInfo("resolved path", { arg, resolved })
-            if (!resolved || containsPath(resolved, instance)) continue
-            const dir = (yield* fs.isDir(resolved)) ? resolved : path.dirname(resolved)
-            scan.dirs.add(dir)
-          }
+          pathArgs(command, ps, shellKind === "cmd").forEach((arg) => candidates.add(arg))
         }
+        if (cmd === "tee") pathArgs(command, ps).forEach((arg) => candidates.add(arg))
+        if (cmd === "dd") {
+          command
+            .slice(1)
+            .map((item) => unquote(item.text).match(/^of=(.+)$/)?.[1])
+            .filter((item): item is string => Boolean(item))
+            .forEach((arg) => candidates.add(arg))
+        }
+        for (const candidate of candidates) yield* inspect(candidate)
 
         if (tokens.length && (!cmd || !CWD.has(cmd))) {
           scan.patterns.add(source(node))
@@ -437,161 +512,233 @@ export const ShellTool = Tool.define(
     ) {
       const limits = yield* trunc.limits()
       const keep = limits.maxBytes * 2
-      let full = ""
       let last = ""
       const list: Chunk[] = []
-      let used = 0
+      const pending: Uint8Array[] = []
+      let displayTailBytes = 0
+      let totalBytes = 0
+      let totalDisplayBytes = 0
+      let totalLines = 0
+      let hasOutput = false
+      let endsWithNewline = false
       let file = ""
-      let sink: ReturnType<typeof createWriteStream> | undefined
+      let sink: FileHandle | undefined
       let cut = false
       let expired = false
       let aborted = false
+      let incomplete = false
 
       const closeSink = Effect.fnUntraced(function* () {
         const stream = sink
         if (!stream) return
+        yield* Effect.tryPromise(() => stream.close())
         sink = undefined
-        if (stream.destroyed || stream.closed) return
-        yield* Effect.promise(
-          () =>
-            new Promise<void>((resolve) => {
-              let settled = false
-              const done = () => {
-                if (settled) return
-                settled = true
-                stream.off("close", done)
-                stream.off("error", done)
-                stream.off("finish", done)
-                resolve()
-              }
-              stream.once("close", done)
-              stream.once("error", done)
-              stream.once("finish", done)
-              stream.end(done)
-            }),
-        ).pipe(Effect.catch(() => Effect.void))
       })
 
-      yield* ctx.metadata({
-        metadata: {
-          output: "",
-        },
+      const discardArtifact = Effect.fnUntraced(function* () {
+        yield* closeSink().pipe(Effect.ignore)
+        if (!file) return
+        yield* fs.remove(file).pipe(Effect.ignore)
+        file = ""
       })
 
-      const code: number | null = yield* Effect.scoped(
-        Effect.gen(function* () {
-          yield* Effect.addFinalizer(closeSink)
-          const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
+      return yield* Effect.gen(function* () {
+        yield* ctx.metadata({
+          metadata: {
+            output: "",
+          },
+        })
 
-          yield* Effect.forkScoped(
-            Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
-              const size = Buffer.byteLength(chunk, "utf-8")
-              list.push({ text: chunk, size })
-              used += size
-              while (used > keep && list.length > 1) {
+        const code: number | null = yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* Effect.addFinalizer(() => closeSink().pipe(Effect.catch(() => Effect.void)))
+            const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
+            const decoder = new TextDecoder()
+            const rootExit = CrossSpawnSpawner.rootExitCode(handle)
+
+            const consume = yield* Effect.forkScoped(
+              Stream.runForEach(handle.all, (bytes) =>
+                Effect.gen(function* () {
+                  const chunk = decoder.decode(bytes, { stream: true })
+                  totalBytes += bytes.byteLength
+                  totalDisplayBytes += Buffer.byteLength(chunk, "utf-8")
+                  totalLines += chunk.split("\n").length - 1
+                  if (chunk) {
+                    hasOutput = true
+                    endsWithNewline = chunk.endsWith("\n")
+                  }
+                  list.push({ text: chunk, size: Buffer.byteLength(chunk, "utf-8") })
+                  displayTailBytes += Buffer.byteLength(chunk, "utf-8")
+                  while (displayTailBytes > keep && list.length > 1) {
+                    const item = list.shift()
+                    if (!item) break
+                    displayTailBytes -= item.size
+                    cut = true
+                  }
+
+                  last = preview(last + chunk)
+
+                  if (sink) {
+                    yield* writeAll(sink, bytes)
+                  } else {
+                    pending.push(bytes.slice())
+                    if (
+                      totalBytes > limits.maxBytes ||
+                      totalDisplayBytes > limits.maxBytes ||
+                      totalLines > limits.maxLines
+                    ) {
+                      yield* Effect.uninterruptible(
+                        Effect.gen(function* () {
+                          file = yield* trunc.write(Buffer.concat(pending))
+                          pending.length = 0
+                          cut = true
+                          sink = yield* Effect.tryPromise(() => open(file, "a"))
+                        }),
+                      )
+                    }
+                  }
+
+                  yield* ctx.metadata({
+                    metadata: {
+                      output: last,
+                    },
+                  })
+                }),
+              ),
+            )
+
+            const abort = Effect.callback<void>((resume) => {
+              if (ctx.abort.aborted) return resume(Effect.void)
+              const handler = () => resume(Effect.void)
+              ctx.abort.addEventListener("abort", handler, { once: true })
+              return Effect.sync(() => ctx.abort.removeEventListener("abort", handler))
+            })
+
+            const timeout = Effect.sleep(`${input.timeout + 100} millis`)
+
+            const exit = yield* Effect.raceAll([
+              rootExit.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
+              abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
+              timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null }))),
+            ])
+
+            if (exit.kind === "abort") {
+              aborted = true
+              yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+            }
+            if (exit.kind === "timeout") {
+              expired = true
+              yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+            }
+
+            yield* CrossSpawnSpawner.finalizeAtRootExit(handle)
+            const drained = yield* Effect.raceFirst(
+              Fiber.join(consume).pipe(Effect.as(true)),
+              Effect.sleep("3 seconds").pipe(Effect.as(false)),
+            )
+            if (!drained) yield* handle.kill({ killSignal: "SIGKILL" }).pipe(Effect.ignore)
+            const forced = drained
+              ? true
+              : yield* Effect.raceFirst(
+                  Fiber.join(consume).pipe(Effect.as(true)),
+                  Effect.sleep("3 seconds").pipe(Effect.as(false)),
+                )
+            if (!forced) {
+              incomplete = true
+              yield* Fiber.interrupt(consume)
+            }
+
+            const final = decoder.decode()
+            if (final) {
+              const size = Buffer.byteLength(final, "utf-8")
+              totalDisplayBytes += size
+              totalLines += final.split("\n").length - 1
+              hasOutput = true
+              endsWithNewline = final.endsWith("\n")
+              list.push({ text: final, size })
+              displayTailBytes += size
+              last = preview(last + final)
+              while (displayTailBytes > keep && list.length > 1) {
                 const item = list.shift()
                 if (!item) break
-                used -= item.size
+                displayTailBytes -= item.size
                 cut = true
               }
-
-              last = preview(last + chunk)
-
-              if (file) {
-                sink?.write(chunk)
-              } else {
-                full += chunk
-                if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
-                  return trunc.write(full).pipe(
-                    Effect.andThen((next) =>
-                      Effect.sync(() => {
-                        file = next
-                        cut = true
-                        sink = createWriteStream(next, { flags: "a" })
-                        full = ""
-                      }),
-                    ),
-                    Effect.andThen(
-                      ctx.metadata({
-                        metadata: {
-                          output: last,
-                        },
-                      }),
-                    ),
-                  )
-                }
+              if (!file && totalDisplayBytes > limits.maxBytes) {
+                yield* Effect.uninterruptible(
+                  Effect.gen(function* () {
+                    file = yield* trunc.write(Buffer.concat(pending))
+                    pending.length = 0
+                    cut = true
+                  }),
+                )
               }
+            }
+            yield* closeSink()
+            if (hasOutput && !endsWithNewline) totalLines++
 
-              return ctx.metadata({
-                metadata: {
-                  output: last,
-                },
-              })
+            return exit.kind === "exit" ? exit.code : null
+          }),
+        ).pipe(Effect.onError(discardArtifact), Effect.orDie)
+
+        const meta: string[] = []
+        if (expired) {
+          meta.push(
+            `shell tool terminated command after exceeding timeout ${input.timeout} ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.`,
+          )
+        }
+        if (aborted) meta.push("User aborted the command")
+        if (incomplete) {
+          meta.push(
+            "Shell output capture stopped after descendant cleanup did not close inherited output pipes; displayed and saved output may be incomplete.",
+          )
+        }
+        const raw = list.map((item) => item.text).join("")
+        const end = tail(raw, limits.maxLines, limits.maxBytes)
+        if (end.cut) cut = true
+        if (!file && end.cut) {
+          yield* Effect.uninterruptible(
+            Effect.gen(function* () {
+              file = yield* trunc.write(Buffer.concat(pending))
             }),
           )
+        }
 
-          const abort = Effect.callback<void>((resume) => {
-            if (ctx.abort.aborted) return resume(Effect.void)
-            const handler = () => resume(Effect.void)
-            ctx.abort.addEventListener("abort", handler, { once: true })
-            return Effect.sync(() => ctx.abort.removeEventListener("abort", handler))
-          })
+        let output = end.text
+        if (!output) output = "(no output)"
 
-          const timeout = Effect.sleep(`${input.timeout + 100} millis`)
+        if (cut && file) {
+          const bufferedTailCut = displayTailBytes < totalDisplayBytes
+          const retainedLines = Math.max(1, end.endLine - end.startLine + 1)
+          const startLine = Math.max(1, totalLines - retainedLines + 1)
+          const range =
+            totalDisplayBytes !== totalBytes
+              ? `Showing a UTF-8-decoded tail of ${end.retainedBytes} display bytes from ${totalBytes} raw bytes (${totalLines} lines total); invalid or incomplete UTF-8 is replaced for display. The saved file contains the exact raw bytes.`
+              : end.kind === "bytes" || bufferedTailCut
+                ? `Showing the last ${end.retainedBytes} bytes of ${totalBytes} bytes (${totalLines} lines total); the first displayed line may be partial.`
+                : `Showing lines ${startLine}-${totalLines} of ${totalLines} (${totalBytes} bytes total).`
+          output =
+            `...output truncated...\n${range}\nFull output saved to: ${file}\n` +
+            `Use grep with path ${JSON.stringify(file)} to search the ${incomplete ? "captured" : "complete"} output, or read with filePath ${JSON.stringify(file)}, offset ${startLine}, and limit ${retainedLines} to inspect the retained range.\n\n` +
+            output
+        }
 
-          const exit = yield* Effect.raceAll([
-            handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
-            abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
-            timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null }))),
-          ])
-
-          if (exit.kind === "abort") {
-            aborted = true
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
-          }
-          if (exit.kind === "timeout") {
-            expired = true
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
-          }
-
-          return exit.kind === "exit" ? exit.code : null
-        }),
-      ).pipe(Effect.orDie)
-
-      const meta: string[] = []
-      if (expired) {
-        meta.push(
-          `shell tool terminated command after exceeding timeout ${input.timeout} ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.`,
-        )
-      }
-      if (aborted) meta.push("User aborted the command")
-      const raw = list.map((item) => item.text).join("")
-      const end = tail(raw, limits.maxLines, limits.maxBytes)
-      if (end.cut) cut = true
-      if (!file && end.cut) {
-        file = yield* trunc.write(raw)
-      }
-
-      let output = end.text
-      if (!output) output = "(no output)"
-
-      if (cut && file) {
-        output = `...output truncated...\n\nFull output saved to: ${file}\n\n` + output
-      }
-
-      if (meta.length > 0) {
-        output += "\n\n<shell_metadata>\n" + meta.join("\n") + "\n</shell_metadata>"
-      }
-      return {
-        title: input.command,
-        metadata: {
-          output: last || preview(output),
-          exit: code,
-          truncated: cut,
-          ...(cut && file ? { outputPath: file } : {}),
-        },
-        output,
-      }
+        if (meta.length > 0) {
+          output += "\n\n<shell_metadata>\n" + meta.join("\n") + "\n</shell_metadata>"
+        }
+        const result = {
+          title: input.command,
+          metadata: {
+            output: last || preview(output),
+            exit: code,
+            truncated: cut,
+            ...(cut && file ? { outputPath: file } : {}),
+          },
+          output,
+        }
+        if (!cut || !file) return result
+        return Tool.attachOwnership(result, trunc.ownership(file))
+      }).pipe(Effect.onError(discardArtifact))
     })
 
     return () =>

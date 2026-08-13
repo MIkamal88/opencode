@@ -41,6 +41,7 @@ import { AgentV2 } from "@opencode-ai/core/agent"
 import { Config } from "@opencode-ai/core/config"
 import { ConfigCompaction } from "@opencode-ai/core/config/compaction"
 import { Tool } from "@opencode-ai/core/tool/tool"
+import { managed } from "@opencode-ai/core/tool/trusted-receipt"
 import {
   SessionContextEpochTable,
   SessionInputTable,
@@ -2946,6 +2947,68 @@ describe("SessionRunnerLLM", () => {
               state: { status: "error", error: { type: "unknown", message: "Tool execution interrupted" } },
             },
           ],
+        },
+      ])
+    }),
+  )
+
+  it.live("retains managed output when interrupted after durable tool publication", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const events = yield* EventV2.Service
+      const registry = yield* ToolRegistry.Service
+      const published = yield* Deferred.make<void>()
+      let retained = 0
+      let discarded = 0
+      yield* registry.register({
+        captured: Tool.make({
+          description: "Capture managed output",
+          input: Schema.Struct({}),
+          output: Schema.String,
+          execute: () =>
+            Effect.succeed(
+              managed("tail", {
+                path: "/managed/interrupted",
+                tail: "tail",
+                rawBytes: 4,
+                displayBytes: 4,
+                totalLines: 1,
+                retainedDisplayBytes: 4,
+                startLine: 1,
+                endLine: 1,
+                byteLimited: false,
+                retain: () => Effect.sync(() => void retained++),
+                discard: () => Effect.sync(() => void discarded++),
+              }),
+            ),
+        }),
+      })
+      yield* events.listen((event) =>
+        event.type === SessionEvent.Tool.Success.type
+          ? Deferred.succeed(published, undefined).pipe(Effect.andThen(Effect.promise(() => Bun.sleep(50))))
+          : Effect.void,
+      )
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Capture before interruption" }), resume: false })
+      response = [
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({ id: "call-captured-interrupted", name: "captured", input: {} }),
+        LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+        LLMEvent.finish({ reason: "tool-calls" }),
+      ]
+
+      const runner = yield* SessionRunner.Service
+      const run = yield* runner.run({ sessionID, force: true }).pipe(Effect.forkChild)
+      yield* Deferred.await(published)
+      yield* Fiber.interrupt(run)
+
+      expect(retained).toBe(1)
+      expect(discarded).toBe(0)
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "user", text: "Capture before interruption" },
+        {
+          type: "assistant",
+          content: [{ type: "tool", id: "call-captured-interrupted", state: { status: "completed" } }],
         },
       ])
     }),

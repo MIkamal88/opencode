@@ -130,10 +130,33 @@ describe("tool parameters", () => {
     })
     test("replaceAll is optional", () => {
       const parsed = parse(Edit, { filePath: "/a", oldString: "x", newString: "y" })
-      expect(parsed.replaceAll).toBeUndefined()
+      expect("replaceAll" in parsed ? parsed.replaceAll : undefined).toBeUndefined()
+    })
+    test("accepts batch edits", () => {
+      expect(parse(Edit, { filePath: "/a", edits: [{ oldString: "x", newString: "y" }] })).toEqual({
+        filePath: "/a",
+        edits: [{ oldString: "x", newString: "y" }],
+      })
     })
     test("rejects missing filePath", () => {
       expect(accepts(Edit, { oldString: "x", newString: "y" })).toBe(false)
+    })
+    test("accepts non-empty batch edits", () => {
+      expect(parse(Edit, { filePath: "/a", edits: [{ oldString: "x", newString: "y" }] })).toEqual({
+        filePath: "/a",
+        edits: [{ oldString: "x", newString: "y" }],
+      })
+    })
+    test("rejects empty and hybrid batches", () => {
+      expect(accepts(Edit, { filePath: "/a", edits: [] })).toBe(false)
+      expect(
+        accepts(Edit, {
+          filePath: "/a",
+          oldString: "x",
+          newString: "y",
+          edits: [{ oldString: "a", newString: "b" }],
+        }),
+      ).toBe(false)
     })
   })
 

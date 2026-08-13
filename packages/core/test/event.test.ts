@@ -13,6 +13,10 @@ import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { eq } from "drizzle-orm"
+import { Project } from "@opencode-ai/core/project"
+import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { SessionTable, SessionReadReceiptTable } from "@opencode-ai/core/session/sql"
+import { SessionReadReceipt } from "@opencode-ai/core/session/read-receipt"
 import { location } from "./fixture/location"
 import { testEffect } from "./lib/effect"
 
@@ -209,6 +213,62 @@ describe("EventV2", () => {
       expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).all()).toEqual([])
       expect(
         yield* db.select().from(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, aggregateID)).all(),
+      ).toEqual([])
+    }),
+  )
+
+  it.effect("rolls back durable event, projector, and receipt through the explicit transaction client", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const sessionID = Session.ID.make("ses_event_receipt_rollback")
+      const canonicalPath = AbsolutePath.make("/project/file.txt")
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+        .onConflictDoNothing()
+        .run()
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: Project.ID.global,
+          slug: sessionID,
+          directory: "/project",
+          title: sessionID,
+          version: "test",
+        })
+        .run()
+      yield* db.run("CREATE TABLE IF NOT EXISTS event_atomic_probe (value text NOT NULL)")
+      yield* db.run("DELETE FROM event_atomic_probe")
+      yield* events.project(SyncMessage, () =>
+        db.run("INSERT INTO event_atomic_probe (value) VALUES ('projected')").pipe(Effect.orDie, Effect.asVoid),
+      )
+
+      const exit = yield* events
+        .publish(
+          SyncMessage,
+          { id: sessionID, text: "hello" },
+          {
+            commit: (seq, tx) =>
+              SessionReadReceipt.upsertIn(tx, {
+                sessionID,
+                canonicalPath,
+                digest: "1".repeat(64),
+                settledSeq: seq,
+              }).pipe(Effect.orDie, Effect.andThen(Effect.die("after receipt"))),
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(String(exit)).toContain("after receipt")
+      expect(yield* db.all("SELECT value FROM event_atomic_probe")).toEqual([])
+      expect(
+        yield* db.select().from(SessionReadReceiptTable).where(eq(SessionReadReceiptTable.session_id, sessionID)).all(),
+      ).toEqual([])
+      expect(yield* db.select().from(EventTable).where(eq(EventTable.aggregate_id, sessionID)).all()).toEqual([])
+      expect(
+        yield* db.select().from(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, sessionID)).all(),
       ).toEqual([])
     }),
   )

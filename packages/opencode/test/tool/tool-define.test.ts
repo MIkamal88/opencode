@@ -107,6 +107,27 @@ describe("Tool.define", () => {
     }),
   )
 
+  it.effect("keeps ownership private and one-shot", () =>
+    Effect.gen(function* () {
+      const settled: string[] = []
+      const result = Tool.attachOwnership(
+        { title: "test", output: "truncated", metadata: { outputPath: "/private/artifact" } },
+        {
+          retain: () => Effect.sync(() => void settled.push("retain")),
+          discard: () => Effect.sync(() => void settled.push("discard")),
+        },
+      )
+
+      expect(JSON.stringify(result)).not.toContain("discard")
+      expect(JSON.stringify(result)).not.toContain("retain")
+      const ownership = Tool.takeOwnership(result)
+      expect(ownership).toBeDefined()
+      expect(Tool.takeOwnership(result)).toBeUndefined()
+      yield* ownership?.discard() ?? Effect.void
+      expect(settled).toEqual(["discard"])
+    }),
+  )
+
   // Regression for #28438: the wrap is the canonical "untyped → typed" boundary.
   // When the LLM emits a tool call with a payload that fails the parameter
   // schema, the wrap must surface a typed `Tool.InvalidArgumentsError` whose

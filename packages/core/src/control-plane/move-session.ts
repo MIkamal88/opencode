@@ -12,6 +12,7 @@ import { SessionSchema } from "../session/schema"
 import { SessionStore } from "../session/store"
 import { AbsolutePath, RelativePath } from "../schema"
 import path from "path"
+import { SessionReadReceipt } from "../session/read-receipt"
 
 export const Destination = Schema.Struct({
   directory: AbsolutePath,
@@ -103,12 +104,18 @@ const layer = Layer.effect(
           .pipe(Effect.mapError((error) => new ApplyChangesError({ message: error.message })))
       }
 
-      yield* events.publish(SessionEvent.Moved, {
-        sessionID: input.sessionID,
-        location: Location.Ref.make({ directory }),
-        subdirectory: RelativePath.make(path.relative(destination.directory, directory).replaceAll("\\", "/")),
-        timestamp: yield* DateTime.now,
-      })
+      yield* events.publish(
+        SessionEvent.Moved,
+        {
+          sessionID: input.sessionID,
+          location: Location.Ref.make({ directory }),
+          subdirectory: RelativePath.make(path.relative(destination.directory, directory).replaceAll("\\", "/")),
+          timestamp: yield* DateTime.now,
+        },
+        {
+          commit: (_seq, client) => SessionReadReceipt.clearIn(client, input.sessionID).pipe(Effect.asVoid),
+        },
+      )
 
       if (patch) {
         const repository = yield* git.repo.discover(current.location.directory)

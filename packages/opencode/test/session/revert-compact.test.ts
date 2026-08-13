@@ -16,10 +16,19 @@ import { provideTmpdirInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { SessionReadReceipt } from "@opencode-ai/core/session/read-receipt"
+import { AbsolutePath } from "@opencode-ai/core/schema"
 
 const it = testEffect(
   LayerNode.compile(
-    LayerNode.group([Session.node, SessionRevert.node, Snapshot.node, SessionProjector.node, CrossSpawnSpawner.node]),
+    LayerNode.group([
+      Session.node,
+      SessionRevert.node,
+      SessionReadReceipt.node,
+      Snapshot.node,
+      SessionProjector.node,
+      CrossSpawnSpawner.node,
+    ]),
   ),
 )
 
@@ -108,6 +117,76 @@ const tokens = {
 }
 
 describe("revert + compact workflow", () => {
+  it.live(
+    "clears read receipts when staging a revert",
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const session = yield* Session.Service
+          const revert = yield* SessionRevert.Service
+          const receipts = yield* SessionReadReceipt.Service
+          const info = yield* session.create({})
+          const message = yield* user(info.id)
+          yield* text(info.id, message.id, "before")
+          const canonicalPath = AbsolutePath.make(path.join(dir, "read.txt"))
+          yield* receipts.upsert({
+            sessionID: info.id,
+            canonicalPath,
+            digest: "1".repeat(64),
+            settledSeq: 1,
+          })
+
+          yield* revert.revert({ sessionID: info.id, messageID: message.id })
+
+          expect(yield* receipts.get({ sessionID: info.id, canonicalPath })).toBeUndefined()
+        }),
+      { git: true },
+    ),
+  )
+
+  it.live(
+    "clears read receipts before staging snapshot mutations",
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const session = yield* Session.Service
+          const revert = yield* SessionRevert.Service
+          const receipts = yield* SessionReadReceipt.Service
+          const snapshots = yield* Snapshot.Service
+          const info = yield* session.create({})
+          const message = yield* user(info.id)
+          yield* text(info.id, message.id, "before")
+          const canonicalPath = AbsolutePath.make(path.join(dir, "read.txt"))
+          yield* receipts.upsert({
+            sessionID: info.id,
+            canonicalPath,
+            digest: "1".repeat(64),
+            settledSeq: 1,
+          })
+          const observed = { receipt: undefined as SessionReadReceipt.Receipt | undefined }
+
+          yield* revert.revert({ sessionID: info.id, messageID: message.id }).pipe(
+            Effect.provideService(
+              Snapshot.Service,
+              Snapshot.Service.of({
+                ...snapshots,
+                track: () =>
+                  receipts.get({ sessionID: info.id, canonicalPath }).pipe(
+                    Effect.orDie,
+                    Effect.tap((receipt) => Effect.sync(() => void (observed.receipt = receipt))),
+                    Effect.as(undefined),
+                  ),
+              }),
+            ),
+          )
+
+          expect(observed.receipt).toBeUndefined()
+          expect(yield* receipts.get({ sessionID: info.id, canonicalPath })).toBeUndefined()
+        }),
+      { git: true },
+    ),
+  )
+
   it.live(
     "should properly handle compact command after revert",
     provideTmpdirInstance(

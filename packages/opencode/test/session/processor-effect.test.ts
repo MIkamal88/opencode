@@ -4,7 +4,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
 import { tool } from "ai"
-import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
@@ -225,6 +225,33 @@ const fragmentFailureLLM = Layer.succeed(
 )
 const fragmentFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, fragmentFailureLLM]])
 const itFragmentFailure = testEffect(fragmentFailureEnv)
+
+const ownershipReady = { current: undefined as Deferred.Deferred<void> | undefined }
+const ownershipRelease = { current: undefined as Deferred.Deferred<void> | undefined }
+const ownershipLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.concat(
+        Stream.make(
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "call-owned", name: "lookup", input: {} }),
+        ),
+        Stream.fromEffect(
+          Effect.gen(function* () {
+            if (ownershipReady.current) yield* Deferred.succeed(ownershipReady.current, undefined)
+            if (ownershipRelease.current) yield* Deferred.await(ownershipRelease.current)
+          }),
+        ).pipe(
+          Stream.flatMap(() =>
+            Stream.make(LLMEvent.stepFinish({ index: 0, reason: "stop" }), LLMEvent.finish({ reason: "stop" })),
+          ),
+        ),
+      ),
+  }),
+)
+const ownershipEnv = LayerNode.compile(root, [...replacements, [LLM.node, ownershipLLM]])
+const itOwnership = testEffect(ownershipEnv)
 
 const boot = Effect.fn("test.boot")(function* () {
   const processors = yield* SessionProcessor.Service
@@ -810,6 +837,181 @@ it.live("session.processor effect tests complete AI SDK tool calls when native f
         expect(call.state.time.end).toBeDefined()
       }),
     { config: (url) => providerCfg(url) },
+  ),
+)
+
+itOwnership.live("session.processor retains completed ownership and discards interrupted ownership", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const lifecycle: string[] = []
+        const ownership = () => ({
+          retain: () => Effect.sync(() => void lifecycle.push("retain")),
+          discard: () => Effect.sync(() => void lifecycle.push("discard")),
+        })
+
+        const successfulChat = yield* session.create({})
+        const successfulParent = yield* user(successfulChat.id, "complete ownership")
+        const successfulMessage = yield* assistant(successfulChat.id, successfulParent.id, path.resolve(dir))
+        const successful = yield* processors.create({
+          assistantMessage: successfulMessage,
+          sessionID: successfulChat.id,
+          model: mdl,
+        })
+        ownershipReady.current = yield* Deferred.make<void>()
+        ownershipRelease.current = yield* Deferred.make<void>()
+        const completed = yield* successful
+          .process({
+            user: {
+              id: successfulParent.id,
+              sessionID: successfulChat.id,
+              role: "user",
+              time: successfulParent.time,
+              agent: successfulParent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: successfulChat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "complete ownership" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+        yield* Deferred.await(ownershipReady.current)
+        yield* successful.ownToolCall("call-owned", ownership())
+        yield* successful.completeToolCall("call-owned", { title: "lookup", metadata: {}, output: "complete" })
+        yield* Deferred.succeed(ownershipRelease.current, undefined)
+        yield* Fiber.join(completed)
+        expect(lifecycle).toEqual(["retain"])
+
+        const interruptedChat = yield* session.create({})
+        const interruptedParent = yield* user(interruptedChat.id, "interrupt ownership")
+        const interruptedMessage = yield* assistant(interruptedChat.id, interruptedParent.id, path.resolve(dir))
+        const interrupted = yield* processors.create({
+          assistantMessage: interruptedMessage,
+          sessionID: interruptedChat.id,
+          model: mdl,
+        })
+        ownershipReady.current = yield* Deferred.make<void>()
+        ownershipRelease.current = yield* Deferred.make<void>()
+        const running = yield* interrupted
+          .process({
+            user: {
+              id: interruptedParent.id,
+              sessionID: interruptedChat.id,
+              role: "user",
+              time: interruptedParent.time,
+              agent: interruptedParent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: interruptedChat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "interrupt ownership" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+        yield* Deferred.await(ownershipReady.current)
+        yield* interrupted.ownToolCall("call-owned", ownership())
+        yield* Deferred.succeed(ownershipRelease.current, undefined)
+        yield* Fiber.interrupt(running)
+        expect(lifecycle).toEqual(["retain", "discard"])
+
+        yield* interrupted.ownToolCall("call-late", ownership())
+        expect(lifecycle).toEqual(["retain", "discard", "discard"])
+
+        ownershipReady.current = undefined
+        ownershipRelease.current = undefined
+      }),
+    { config: cfg },
+  ),
+)
+
+itOwnership.live("session.processor settles ownership around durable publication failures", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const events = yield* EventV2Bridge.Service
+        const lifecycle: string[] = []
+        const ownership = () => ({
+          retain: () => Effect.sync(() => void lifecycle.push("retain")),
+          discard: () => Effect.sync(() => void lifecycle.push("discard")),
+        })
+        const start = Effect.fnUntraced(function* (label: string) {
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, label)
+          const message = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const handle = yield* processors.create({ assistantMessage: message, sessionID: chat.id, model: mdl })
+          ownershipReady.current = yield* Deferred.make<void>()
+          ownershipRelease.current = yield* Deferred.make<void>()
+          const running = yield* handle
+            .process({
+              user: {
+                id: parent.id,
+                sessionID: chat.id,
+                role: "user",
+                time: parent.time,
+                agent: parent.agent,
+                model: { providerID: ref.providerID, modelID: ref.modelID },
+              } satisfies SessionV1.User,
+              sessionID: chat.id,
+              model: mdl,
+              agent: agent(),
+              system: [],
+              messages: [{ role: "user", content: label }],
+              tools: {},
+            })
+            .pipe(Effect.forkChild)
+          yield* Deferred.await(ownershipReady.current)
+          yield* handle.ownToolCall("call-owned", ownership())
+          return { chat, message, handle, running, release: ownershipRelease.current }
+        })
+
+        const before = yield* start("precommit failure")
+        const precommit = yield* before.handle
+          .completeToolCall("call-owned", { title: "lookup", metadata: {}, output: "uncommitted" }, () =>
+            Effect.die("injected commit failure"),
+          )
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(precommit)).toBeTrue()
+        expect(lifecycle).toEqual(["discard"])
+        yield* Deferred.succeed(before.release, undefined)
+        yield* Fiber.join(before.running)
+
+        const after = yield* start("postcommit interruption")
+        const off = yield* events.listen((event) => {
+          if (event.type !== MessageV2.Event.PartUpdated.type) return Effect.void
+          const data = event.data as typeof MessageV2.Event.PartUpdated.data.Type
+          return data.part.type === "tool" &&
+            data.part.callID === "call-owned" &&
+            data.part.state.status === "completed"
+            ? Effect.interrupt
+            : Effect.void
+        })
+        const postcommit = yield* after.handle
+          .completeToolCall("call-owned", { title: "lookup", metadata: {}, output: "committed" })
+          .pipe(Effect.exit)
+        yield* off
+        expect(Exit.isFailure(postcommit) && Cause.hasInterrupts(postcommit.cause)).toBeTrue()
+        expect(lifecycle).toEqual(["discard", "retain"])
+        expect(
+          (yield* MessageV2.parts(after.message.id)).some(
+            (part) => part.type === "tool" && part.callID === "call-owned" && part.state.status === "completed",
+          ),
+        ).toBeTrue()
+        yield* Deferred.succeed(after.release, undefined)
+        yield* Fiber.join(after.running)
+
+        ownershipReady.current = undefined
+        ownershipRelease.current = undefined
+      }),
+    { config: cfg },
   ),
 )
 

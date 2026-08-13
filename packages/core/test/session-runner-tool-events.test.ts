@@ -8,14 +8,16 @@ import { SessionV2 } from "@opencode-ai/core/session"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { createLLMEventPublisher } from "@opencode-ai/core/session/runner/publish-llm-event"
+import { AbsolutePath } from "@opencode-ai/core/schema"
 
 const sessionID = SessionV2.ID.make("ses_tool_event_test")
 const base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
 
 const capture = () => {
   const published: Array<{ readonly type: string; readonly data: unknown }> = []
+  const commits: Array<NonNullable<EventV2.PublishOptions["commit"]>> = []
   const events = EventV2.Service.of({
-    publish: (definition, data) =>
+    publish: (definition, data, options) =>
       Effect.sync(() => {
         const event = { id: EventV2.ID.create(), type: definition.type, data } as EventV2.Payload<typeof definition>
         published.push({
@@ -24,6 +26,7 @@ const capture = () => {
             : definition.type,
           data,
         })
+        if (options?.commit) commits.push(options.commit)
         return event
       }),
     subscribe: () => Stream.empty,
@@ -38,6 +41,7 @@ const capture = () => {
   })
   return {
     published,
+    commits,
     publisher: createLLMEventPublisher(events, {
       sessionID,
       agent: "build",
@@ -69,6 +73,18 @@ const result = LLMEvent.toolResult({
   },
 })
 
+test("local tool success keeps receipt closed and attaches one atomic commit", async () => {
+  const { commits, published, publisher } = capture()
+  const receipt = { canonicalPath: AbsolutePath.make("/project/pixel.png"), digest: "1".repeat(64) }
+  await Effect.runPromise(publisher.publish(call))
+  await Effect.runPromise(publisher.publish(result, [], receipt))
+
+  expect(commits).toHaveLength(1)
+  expect(JSON.stringify(published)).not.toContain(receipt.digest)
+  expect(JSON.stringify(published)).not.toContain(receipt.canonicalPath)
+  expect(commits[0]).toBeFunction()
+})
+
 test("local tool success serializes media base64 once and reconstructs from structured content", async () => {
   const { published, publisher } = capture()
   await Effect.runPromise(publisher.publish(call))
@@ -86,6 +102,16 @@ test("local tool success serializes media base64 once and reconstructs from stru
       { type: "file", uri: `data:image/png;base64,${base64}`, mime: "image/png" },
     ],
   })
+})
+
+test("local tool success persists exactly one managed output path", async () => {
+  const { published, publisher } = capture()
+  await Effect.runPromise(publisher.publish(call))
+  await Effect.runPromise(publisher.publish(result, ["/managed/bash-output"]))
+
+  const success = published.find((event) => event.type === "session.next.tool.success.1")
+  expect(success?.data).toMatchObject({ outputPaths: ["/managed/bash-output"] })
+  expect(JSON.stringify(success).split("/managed/bash-output")).toHaveLength(2)
 })
 
 test("provider-executed success retains its compatibility result", async () => {

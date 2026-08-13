@@ -3,6 +3,7 @@ import type { PlatformError } from "effect/PlatformError"
 import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { CrossSpawnSpawner } from "./cross-spawn-spawner"
+import type { ToolOutputStore } from "./tool-output-store"
 import { makeGlobalNode } from "./effect/app-node"
 
 export class AppProcessError extends Schema.TaggedErrorClass<AppProcessError>()("AppProcessError", {
@@ -35,6 +36,18 @@ export interface RunStreamOptions {
   readonly maxErrorBytes?: number
 }
 
+export interface RunCaptureOptions {
+  readonly signal?: AbortSignal
+  readonly timeout?: Duration.Input
+}
+
+export interface RunCaptureResult {
+  readonly command: string
+  readonly exitCode?: number
+  readonly timeout: boolean
+  readonly capture: ToolOutputStore.ManagedOutput
+}
+
 export interface RunResult {
   readonly command: string
   readonly exitCode: number
@@ -48,6 +61,11 @@ export interface RunResult {
 
 export type Interface = ChildProcessSpawner["Service"] & {
   readonly run: (command: ChildProcess.Command, options?: RunOptions) => Effect.Effect<RunResult, AppProcessError>
+  readonly runCapture: (
+    command: ChildProcess.Command,
+    capture: ToolOutputStore.Capture,
+    options?: RunCaptureOptions,
+  ) => Effect.Effect<RunCaptureResult, AppProcessError | ToolOutputStore.StorageError>
   readonly runStream: (
     command: ChildProcess.Command,
     options?: RunStreamOptions,
@@ -211,6 +229,93 @@ const layer = Layer.effect(
       return yield* runCommand(next, options)
     })
 
+    const runCapture = Effect.fn("AppProcess.runCapture")(function* (
+      command: ChildProcess.Command,
+      capture: ToolOutputStore.Capture,
+      options?: RunCaptureOptions,
+    ) {
+      const description = describeCommand(command)
+      const execute = Effect.scoped(
+        Effect.gen(function* () {
+          const handle = yield* spawner.spawn(command)
+          let version = 0
+          let processing = false
+          const rootExit = CrossSpawnSpawner.rootExitCode(handle)
+          const idle = rootExit.pipe(
+            Effect.andThen(
+              Effect.gen(function* () {
+                while (true) {
+                  const observed = version
+                  yield* Effect.sleep("1 second")
+                  if (version === observed && !processing) return
+                }
+              }),
+            ),
+          )
+          const consume = yield* handle.all.pipe(
+            Stream.interruptWhen(idle),
+            Stream.runForEach((bytes) =>
+              Effect.gen(function* () {
+                processing = true
+                yield* capture.write(bytes)
+                version++
+              }).pipe(Effect.ensuring(Effect.sync(() => (processing = false)))),
+            ),
+            Effect.forkScoped,
+          )
+          const consumerFailed = Fiber.await(consume).pipe(
+            Effect.flatMap((exit) => (exit._tag === "Failure" ? Effect.failCause(exit.cause) : Effect.never)),
+          )
+          const completed = rootExit.pipe(
+            Effect.flatMap((code) =>
+              Effect.raceFirst(Fiber.join(consume).pipe(Effect.asVoid), Effect.sleep("1 second")).pipe(
+                Effect.andThen(CrossSpawnSpawner.finalizeAtRootExit(handle)),
+                Effect.andThen(Fiber.join(consume)),
+                Effect.as({ timeout: false as const, code }),
+              ),
+            ),
+          )
+          const lifecycle = options?.timeout
+            ? Effect.raceFirst(completed, Effect.sleep(options.timeout).pipe(Effect.as({ timeout: true as const })))
+            : completed
+          const settled = yield* Effect.raceFirst(lifecycle, consumerFailed).pipe(
+            Effect.onError(() => handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.ignore)),
+          )
+          if (settled.timeout) yield* handle.kill({ forceKillAfter: "3 seconds" })
+          if (settled.timeout)
+            yield* Fiber.join(consume).pipe(
+              Effect.timeoutOrElse({
+                duration: "1 second",
+                orElse: () => Fiber.interrupt(consume).pipe(Effect.asVoid),
+              }),
+            )
+          return {
+            command: description,
+            ...(settled.timeout ? {} : { exitCode: settled.code }),
+            timeout: settled.timeout,
+            capture: yield* capture.finish(),
+          }
+        }),
+      )
+      const aborted = options?.signal
+        ? execute.pipe(
+            Effect.raceFirst(
+              waitForAbort(options.signal).pipe(Effect.mapError((cause) => wrapError(description, cause))),
+            ),
+          )
+        : execute
+      return yield* aborted.pipe(
+        Effect.mapError((cause) =>
+          typeof cause === "object" &&
+          cause !== null &&
+          "_tag" in cause &&
+          cause._tag === "ToolOutputStore.StorageError"
+            ? cause
+            : wrapError(description, cause),
+        ),
+      )
+    })
+
     const runStream = (
       command: ChildProcess.Command,
       options?: RunStreamOptions,
@@ -252,7 +357,7 @@ const layer = Layer.effect(
       )
     }
 
-    return Service.of({ ...spawner, run, runStream })
+    return Service.of({ ...spawner, run, runCapture, runStream })
   }),
 )
 

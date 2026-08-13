@@ -10,6 +10,7 @@ import { SessionEvent } from "./event"
 import { SessionMessage } from "./message"
 import { SessionSchema } from "./schema"
 import { SessionMessageTable } from "./sql"
+import { SessionReadReceipt } from "./read-receipt"
 
 export class MessageNotFoundError extends Schema.TaggedErrorClass<MessageNotFoundError>()(
   "Session.MessageNotFoundError",
@@ -64,6 +65,7 @@ export const stage = Effect.fn("SessionRevert.stage")(function* (input: {
 }) {
   const snapshot = yield* Snapshot.Service
   const events = yield* EventV2.Service
+  const receipts = yield* SessionReadReceipt.Service
   const original = input.session.revert?.snapshot
     ? Snapshot.ID.make(input.session.revert.snapshot)
     : yield* snapshot.capture()
@@ -73,6 +75,7 @@ export const stage = Effect.fn("SessionRevert.stage")(function* (input: {
     for (const file of input.session.revert?.files ?? []) restore.set(file.path, original)
   }
   if (input.files !== false) for (const [file, tree] of next) restore.set(file, tree)
+  yield* receipts.clear(input.session.id)
   if (restore.size) yield* snapshot.restore({ files: restore })
   const paths = input.files === false ? [] : Array.from(next.keys())
   const files = original
@@ -96,6 +99,8 @@ export const stage = Effect.fn("SessionRevert.stage")(function* (input: {
 })
 
 export const clear = Effect.fn("SessionRevert.clear")(function* (session: SessionSchema.Info) {
+  const receipts = yield* SessionReadReceipt.Service
+  yield* receipts.clear(session.id)
   if (!session.revert) return
   const snapshot = yield* Snapshot.Service
   const original = session.revert.snapshot ? Snapshot.ID.make(session.revert.snapshot) : undefined
@@ -113,9 +118,15 @@ export const clear = Effect.fn("SessionRevert.clear")(function* (session: Sessio
 export const commit = Effect.fn("SessionRevert.commit")(function* (session: SessionSchema.Info) {
   if (!session.revert) return
   const events = yield* EventV2.Service
-  yield* events.publish(SessionEvent.RevertEvent.Committed, {
-    sessionID: session.id,
-    messageID: session.revert.messageID,
-    timestamp: yield* DateTime.now,
-  })
+  yield* events.publish(
+    SessionEvent.RevertEvent.Committed,
+    {
+      sessionID: session.id,
+      messageID: session.revert.messageID,
+      timestamp: yield* DateTime.now,
+    },
+    {
+      commit: (_seq, client) => SessionReadReceipt.clearIn(client, session.id).pipe(Effect.asVoid),
+    },
+  )
 })

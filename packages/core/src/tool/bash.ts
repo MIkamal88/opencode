@@ -11,14 +11,15 @@ import { LocationMutation } from "../location-mutation"
 import { AppProcess } from "../process"
 import { PermissionV2 } from "../permission"
 import { PositiveInt } from "../schema"
+import { ToolOutputStore } from "../tool-output-store"
 import { ToolRegistry } from "./registry"
 import { Tool } from "./tool"
 import { Tools } from "./tools"
+import { managed } from "./trusted-receipt"
 
 export const name = "bash"
 export const DEFAULT_TIMEOUT_MS = 2 * 60 * 1_000
 export const MAX_TIMEOUT_MS = 10 * 60 * 1_000
-export const MAX_CAPTURE_BYTES = 1024 * 1024
 
 export const Input = Schema.Struct({
   command: Schema.String.annotate({ description: "Shell command string to execute" }),
@@ -56,9 +57,6 @@ const modelOutput = (output: Output) => {
   return `${warnings.trimStart()}${warnings ? "\n\n" : ""}Command exited with code ${output.exit}.`
 }
 
-const isTimeout = (error: AppProcess.AppProcessError) =>
-  error.cause instanceof Error && error.cause.message === "Timed out"
-
 /**
  * Minimal V2 core shell boundary. Keep parity debt visible without pulling the
  * legacy shell runtime into core.
@@ -73,8 +71,6 @@ const isTimeout = (error: AppProcess.AppProcessError) =>
 // TODO: Re-add model-facing background launch only with owner-bound get/wait/cancel tools and completion delivery.
 // TODO: Add HTTP background-job observation only after durable status, restart recovery, and authorization are defined.
 // TODO: Revisit process-group cleanup and platform coverage with shell-specific tests if current AppProcess semantics do not fully cover it.
-// TODO: Revisit binary output handling if stdout/stderr decoding is text-only.
-// TODO: Stream full shell output into managed storage while retaining only a bounded in-memory preview.
 
 const shellTokens = (command: string) => command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? []
 const unquote = (value: string) => value.replace(/^(['"])(.*)\1$/, "$2")
@@ -100,6 +96,7 @@ const layer = Layer.effectDiscard(
     const mutation = yield* LocationMutation.Service
     const fs = yield* FSUtil.Service
     const appProcess = yield* AppProcess.Service
+    const outputStore = yield* ToolOutputStore.Service
     const config = yield* Config.Service
     const permission = yield* PermissionV2.Service
 
@@ -163,37 +160,40 @@ const layer = Layer.effectDiscard(
                 forceKillAfter: Duration.seconds(3),
               })
               const timeout = input.timeout ?? DEFAULT_TIMEOUT_MS
-              const result = yield* appProcess
-                .run(command, {
-                  combineOutput: true,
-                  timeout: Duration.millis(timeout),
-                  maxOutputBytes: MAX_CAPTURE_BYTES,
-                })
-                .pipe(
-                  Effect.catchTag("AppProcessError", (error) =>
-                    isTimeout(error) ? Effect.succeed(undefined) : Effect.fail(error),
-                  ),
-                )
-              if (!result) {
-                return {
-                  output: `Command exceeded timeout of ${timeout} ms. Retry with a larger timeout if the command is expected to take longer.`,
-                  truncated: false,
-                  timeout: true,
-                  ...(warnings.length ? { warnings } : {}),
-                }
-              }
-
-              const output = result.output?.toString("utf8") || "(no output)"
-              const notice = result.outputTruncated
-                ? "[output capture truncated at the in-memory safety limit]"
-                : undefined
-              return {
-                exit: result.exitCode,
-                output: notice ? `${output}\n\n${notice}` : output,
-                truncated: result.outputTruncated === true,
-                ...(warnings.length ? { warnings } : {}),
-              }
-            }).pipe(Effect.mapError(() => new ToolFailure({ message: `Unable to execute command: ${input.command}` }))),
+              return yield* Effect.scoped(
+                Effect.gen(function* () {
+                  const capture = yield* outputStore.capture()
+                  const result = yield* appProcess
+                    .runCapture(command, capture, { timeout: Duration.millis(timeout) })
+                    .pipe(Effect.onError(() => capture.discard()))
+                  const artifact = result.capture
+                  const range =
+                    artifact.displayBytes !== artifact.rawBytes
+                      ? `Showing a UTF-8-decoded tail of ${artifact.retainedDisplayBytes} display bytes from ${artifact.rawBytes} raw bytes (${artifact.totalLines} lines total); invalid or incomplete UTF-8 is replaced for display. The saved file contains the exact raw bytes.`
+                      : artifact.byteLimited
+                        ? `Showing the last ${artifact.retainedDisplayBytes} bytes of ${artifact.rawBytes} bytes (${artifact.totalLines} lines total); the first displayed line may be partial.`
+                        : `Showing lines ${artifact.startLine}-${artifact.endLine} of ${artifact.totalLines} (${artifact.rawBytes} bytes total).`
+                  const continuation = artifact.path
+                    ? `...output truncated...\n${range}\nFull output saved to: ${artifact.path}\nUse read with path ${JSON.stringify(artifact.path)}, offset ${artifact.startLine}, and limit ${Math.max(1, artifact.endLine - artifact.startLine + 1)} to inspect the retained range.\n\n`
+                    : ""
+                  const output = artifact.tail || "(no output)"
+                  const value = {
+                    ...(result.exitCode === undefined ? {} : { exit: result.exitCode }),
+                    output: continuation + output,
+                    truncated: Boolean(artifact.path),
+                    ...(result.timeout ? { timeout: true } : {}),
+                    ...(warnings.length ? { warnings } : {}),
+                  }
+                  return artifact.path ? managed(value, artifact) : value
+                }),
+              )
+            }).pipe(
+              Effect.mapError((error) =>
+                error instanceof ToolOutputStore.StorageError
+                  ? error
+                  : new ToolFailure({ message: `Unable to execute command: ${input.command}` }),
+              ),
+            ),
         }),
       })
       .pipe(Effect.orDie)
@@ -203,5 +203,13 @@ const layer = Layer.effectDiscard(
 export const node = makeLocationNode({
   name: "tool/bash",
   layer,
-  deps: [ToolRegistry.node, LocationMutation.node, FSUtil.node, AppProcess.node, Config.node, PermissionV2.node],
+  deps: [
+    ToolRegistry.node,
+    LocationMutation.node,
+    FSUtil.node,
+    AppProcess.node,
+    Config.node,
+    PermissionV2.node,
+    ToolOutputStore.node,
+  ],
 })

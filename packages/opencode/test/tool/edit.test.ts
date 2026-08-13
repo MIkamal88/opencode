@@ -15,6 +15,20 @@ import { SessionID, MessageID } from "../../src/session/schema"
 import * as Tool from "../../src/tool/tool"
 import { testEffect } from "../lib/effect"
 import { Watcher } from "@opencode-ai/core/filesystem/watcher"
+import { FileMutationState } from "@/tool/file-mutation-state"
+
+const receipt = (initial?: Uint8Array) => {
+  const state = { digest: initial ? new Bun.CryptoHasher("sha256").update(initial).digest("hex") : undefined }
+  return {
+    state,
+    channel: {
+      match: (input: { digest: string }) => Effect.succeed(state.digest === input.digest),
+      invalidate: () => Effect.sync(() => void (state.digest = undefined)),
+      settle: (input: { digest: string }) => Effect.sync(() => void (state.digest = input.digest)),
+      pending: () => undefined,
+    },
+  }
+}
 
 const ctx = {
   sessionID: SessionID.make("ses_test-edit-session"),
@@ -25,6 +39,12 @@ const ctx = {
   messages: [],
   metadata: () => Effect.void,
   ask: () => Effect.void,
+  receipt: {
+    match: () => Effect.succeed(true),
+    invalidate: () => Effect.void,
+    settle: () => Effect.void,
+    pending: () => undefined,
+  },
 }
 
 afterEach(async () => {
@@ -32,7 +52,15 @@ afterEach(async () => {
 })
 
 const layer = LayerNode.compile(
-  LayerNode.group([LSP.node, FSUtil.node, Format.node, EventV2Bridge.node, Truncate.node, Agent.node]),
+  LayerNode.group([
+    LSP.node,
+    FSUtil.node,
+    Format.node,
+    EventV2Bridge.node,
+    Truncate.node,
+    Agent.node,
+    FileMutationState.node,
+  ]),
 )
 
 const it = testEffect(layer)
@@ -52,6 +80,18 @@ const run = Effect.fn("EditToolTest.run")(function* (
 
 const fail = Effect.fn("EditToolTest.fail")(function* (args: Tool.InferParameters<typeof EditTool>) {
   const exit = yield* run(args).pipe(Effect.exit)
+  if (Exit.isFailure(exit)) {
+    const err = Cause.squash(exit.cause)
+    return err instanceof Error ? err : new Error(String(err))
+  }
+  throw new Error("expected edit to fail")
+})
+
+const failWithContext = Effect.fn("EditToolTest.failWithContext")(function* (
+  args: Tool.InferParameters<typeof EditTool>,
+  next: Tool.Context,
+) {
+  const exit = yield* run(args, next).pipe(Effect.exit)
   if (Exit.isFailure(exit)) {
     const err = Cause.squash(exit.cause)
     return err instanceof Error ? err : new Error(String(err))
@@ -90,6 +130,215 @@ const onceBus = Effect.fn("EditToolTest.onceBus")(function* (def: typeof Watcher
 })
 
 describe("tool.edit", () => {
+  describe("read receipts", () => {
+    it.instance("fails closed when the internal receipt channel is unavailable", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "unavailable.txt")
+        yield* put(filepath, "one")
+
+        expect(
+          (yield* failWithContext(
+            { filePath: filepath, oldString: "one", newString: "two" },
+            { ...ctx, receipt: undefined },
+          )).message,
+        ).toContain("receipt channel is unavailable")
+        expect(yield* load(filepath)).toBe("one")
+      }),
+    )
+
+    it.instance("rejects missing and stale receipts and refreshes a successful mutation", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "receipt.txt")
+        yield* put(filepath, "one")
+        const tracked = receipt()
+        const next = { ...ctx, receipt: tracked.channel }
+
+        expect(
+          (yield* failWithContext({ filePath: filepath, oldString: "one", newString: "two" }, next)).message,
+        ).toContain("has not been read")
+        tracked.state.digest = new Bun.CryptoHasher("sha256").update("one").digest("hex")
+        yield* put(filepath, "external")
+        expect(
+          (yield* failWithContext({ filePath: filepath, oldString: "external", newString: "two" }, next)).message,
+        ).toContain("changed since")
+        tracked.state.digest = new Bun.CryptoHasher("sha256").update("external").digest("hex")
+        yield* run({ filePath: filepath, oldString: "external", newString: "two" }, next)
+        expect(tracked.state.digest).toBe(new Bun.CryptoHasher("sha256").update("two").digest("hex"))
+      }),
+    )
+
+    it.instance("canonicalizes existing symlink aliases", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "target.txt")
+        const alias = path.join(test.directory, "alias.txt")
+        yield* put(filepath, "one")
+        yield* Effect.promise(() => fs.symlink(filepath, alias))
+        const tracked = receipt(Buffer.from("one"))
+        yield* run({ filePath: alias, oldString: "one", newString: "two" }, { ...ctx, receipt: tracked.channel })
+        expect(yield* load(filepath)).toBe("two")
+      }),
+    )
+
+    it.instance("revalidates the bytes after permission approval", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "permission-race.txt")
+        yield* put(filepath, "one")
+        const tracked = receipt(Buffer.from("one"))
+        const error = yield* failWithContext(
+          { filePath: filepath, oldString: "one", newString: "two" },
+          {
+            ...ctx,
+            receipt: tracked.channel,
+            ask: () => Effect.promise(() => fs.writeFile(filepath, "external")),
+          },
+        )
+
+        expect(error.message).toContain("changed while waiting for permission")
+        expect(yield* load(filepath)).toBe("external")
+      }),
+    )
+
+    it.instance("rejects malformed UTF-8 without permission or mutation", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "malformed.txt")
+        const bytes = Buffer.concat([Buffer.alloc(4096, 0x61), Buffer.from([0xff]), Buffer.from("editable")])
+        yield* Effect.promise(() => fs.writeFile(filepath, bytes))
+        const tracked = receipt(bytes)
+        let asked = false
+
+        expect(
+          (yield* failWithContext(
+            { filePath: filepath, oldString: "editable", newString: "changed" },
+            { ...ctx, receipt: tracked.channel, ask: () => Effect.sync(() => void (asked = true)) },
+          )).message,
+        ).toContain("malformed UTF-8")
+        expect(asked).toBeFalse()
+        expect(Buffer.compare(yield* Effect.promise(() => fs.readFile(filepath)), bytes)).toBe(0)
+      }),
+    )
+
+    it.instance("creates new files exclusively after permission approval", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "creation-race.txt")
+        const error = yield* failWithContext(
+          { filePath: filepath, oldString: "", newString: "agent" },
+          {
+            ...ctx,
+            ask: () => Effect.promise(() => fs.writeFile(filepath, "external")),
+          },
+        )
+
+        expect(error.message).toContain("created while waiting for permission")
+        expect(yield* load(filepath)).toBe("external")
+      }),
+    )
+  })
+
+  describe("batch edits", () => {
+    it.instance("matches every entry against the original snapshot", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "batch.txt")
+        yield* put(filepath, "alpha beta gamma")
+        yield* run({
+          filePath: filepath,
+          edits: [
+            { oldString: "alpha", newString: "beta" },
+            { oldString: "beta", newString: "delta" },
+          ],
+        })
+        expect(yield* load(filepath)).toBe("beta delta gamma")
+      }),
+    )
+
+    it.instance("reports indexed ambiguity and leaves the file unchanged", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "ambiguous.txt")
+        yield* put(filepath, "same x same")
+        const error = yield* fail({
+          filePath: filepath,
+          edits: [
+            { oldString: "x", newString: "y" },
+            { oldString: "same", newString: "other" },
+          ],
+        })
+        expect(error.message).toContain("edits[1]")
+        expect(error.message).toContain("multiple matches")
+        expect(yield* load(filepath)).toBe("same x same")
+      }),
+    )
+
+    it.instance("rejects distinct unique candidates produced by fuzzy matchers", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "fuzzy-ambiguous.txt")
+        yield* put(filepath, "target value\ntarget    value")
+        const error = yield* fail({
+          filePath: filepath,
+          edits: [{ oldString: "target\tvalue", newString: "changed" }],
+        })
+
+        expect(error.message).toContain("multiple fuzzy matches")
+        expect(yield* load(filepath)).toBe("target value\ntarget    value")
+      }),
+    )
+
+    it.instance("rejects equally plausible block-anchor candidates", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "block-ambiguous.txt")
+        yield* put(filepath, "start\nactual abd\nend\nnoise\nstart\nactual abe\nend\n")
+        const error = yield* fail({
+          filePath: filepath,
+          edits: [{ oldString: "start\nactual abf\nend", newString: "changed" }],
+        })
+
+        expect(error.message).toContain("multiple fuzzy matches")
+        expect(yield* load(filepath)).toBe("start\nactual abd\nend\nnoise\nstart\nactual abe\nend\n")
+      }),
+    )
+
+    it.instance("rejects overlapping entries before writing", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "overlap.txt")
+        yield* put(filepath, "abcdef")
+        const error = yield* fail({
+          filePath: filepath,
+          edits: [
+            { oldString: "abcd", newString: "x" },
+            { oldString: "cdef", newString: "y" },
+          ],
+        })
+        expect(error.message).toContain("edits[1]")
+        expect(error.message).toContain("overlaps edits[0]")
+        expect(yield* load(filepath)).toBe("abcdef")
+      }),
+    )
+
+    it.instance("preserves BOM and CRLF across a batch", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "batch.cs")
+        yield* put(filepath, "\uFEFFone\r\ntwo\r\n")
+        yield* run({
+          filePath: filepath,
+          edits: [
+            { oldString: "one\n", newString: "first\n" },
+            { oldString: "two", newString: "second" },
+          ],
+        })
+        expect(yield* Effect.promise(() => fs.readFile(filepath))).toEqual(Buffer.from("\uFEFFfirst\r\nsecond\r\n"))
+      }),
+    )
+  })
   describe("creating new files", () => {
     it.instance("creates new file when oldString is empty", () =>
       Effect.gen(function* () {
@@ -526,6 +775,62 @@ describe("tool.edit", () => {
   })
 
   describe("concurrent editing", () => {
+    it.instance("retains the lock across post-hook and durable publication settlement", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "settlement.txt")
+        yield* put(filepath, "one")
+        const pending = {
+          value: undefined as
+            | { canonicalPath: string; digest: string; release?: () => Effect.Effect<void> }
+            | undefined,
+        }
+        const channel = {
+          match: (input: { digest: string }) =>
+            Effect.succeed(input.digest === new Bun.CryptoHasher("sha256").update(yieldDigest()).digest("hex")),
+          invalidate: () => Effect.void,
+          settle: (input: NonNullable<typeof pending.value>) => Effect.sync(() => void (pending.value = input)),
+          pending: () => pending.value,
+        }
+        const yieldDigest = () => (pending.value ? "two" : "one")
+        yield* run({ filePath: filepath, oldString: "one", newString: "two" }, { ...ctx, receipt: channel })
+        const secondAsked = yield* Deferred.make<void>()
+        const second = yield* run(
+          { filePath: filepath, oldString: "two", newString: "three" },
+          { ...ctx, receipt: channel, ask: () => Deferred.succeed(secondAsked, undefined) },
+        ).pipe(Effect.forkChild)
+        yield* Effect.yieldNow
+        expect(yield* Deferred.isDone(secondAsked)).toBeFalse()
+
+        yield* pending.value!.release!()
+        yield* Deferred.await(secondAsked)
+        yield* Fiber.join(second)
+        yield* pending.value!.release!()
+        expect(yield* load(filepath)).toBe("three")
+      }),
+    )
+
+    it.instance("releases an interrupted mutation before settlement", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "interrupted.txt")
+        yield* put(filepath, "one")
+        const entered = yield* Deferred.make<void>()
+        const interrupted = yield* run(
+          { filePath: filepath, oldString: "one", newString: "two" },
+          {
+            ...ctx,
+            ask: () => Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+          },
+        ).pipe(Effect.forkChild)
+        yield* Deferred.await(entered)
+        yield* Fiber.interrupt(interrupted)
+
+        yield* run({ filePath: filepath, oldString: "one", newString: "three" })
+        expect(yield* load(filepath)).toBe("three")
+      }),
+    )
+
     it.instance("preserves concurrent edits to different sections of the same file", () =>
       Effect.gen(function* () {
         const test = yield* TestInstance

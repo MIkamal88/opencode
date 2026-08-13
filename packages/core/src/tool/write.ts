@@ -15,6 +15,7 @@ import { PermissionV2 } from "../permission"
 import { ToolRegistry } from "./registry"
 import { Tool } from "./tool"
 import { Tools } from "./tools"
+import { make as trustedReceipt } from "./trusted-receipt"
 
 export const name = "write"
 
@@ -84,7 +85,12 @@ const layer = Layer.effectDiscard(
                   agent: context.agent,
                   source,
                 })
-                return yield* files.writeTextPreservingBom({ target, content: input.content })
+                const result = yield* files.createOrCheckedOverwriteText({
+                  sessionID: context.sessionID,
+                  target,
+                  content: input.content,
+                })
+                return trustedReceipt(result.result, result.receipt, result.release)
               }).pipe(Effect.mapError(() => new ToolFailure({ message: `Unable to write ${input.path}` }))),
           }),
           "edit",

@@ -5,6 +5,8 @@ import { ModelV2 } from "../../model"
 import { SessionEvent } from "../event"
 import { SessionMessage } from "../message"
 import { SessionSchema } from "../schema"
+import { SessionReadReceipt } from "../read-receipt"
+import type { Receipt } from "../../tool/trusted-receipt"
 
 type Input = {
   readonly sessionID: SessionSchema.ID
@@ -239,6 +241,7 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
   const publish = Effect.fn("SessionRunner.publishLLMEvent")(function* (
     event: LLMEvent,
     outputPaths: ReadonlyArray<string> = [],
+    receipt?: Receipt,
   ) {
     switch (event.type) {
       case "step-start":
@@ -361,16 +364,31 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
           })
           return
         }
-        yield* events.publish(SessionEvent.Tool.Success, {
-          sessionID: input.sessionID,
-          timestamp: yield* timestamp,
-          assistantMessageID: tool.assistantMessageID,
-          callID: event.id,
-          ...result,
-          outputPaths,
-          ...(provider.executed ? { result: event.result } : {}),
-          provider,
-        })
+        yield* events.publish(
+          SessionEvent.Tool.Success,
+          {
+            sessionID: input.sessionID,
+            timestamp: yield* timestamp,
+            assistantMessageID: tool.assistantMessageID,
+            callID: event.id,
+            ...result,
+            outputPaths,
+            ...(provider.executed ? { result: event.result } : {}),
+            provider,
+          },
+          receipt
+            ? {
+                commit: (seq, client) =>
+                  SessionReadReceipt.upsertIn(client, {
+                    sessionID: input.sessionID,
+                    canonicalPath: receipt.canonicalPath,
+                    digest: receipt.digest,
+                    settledSeq: seq,
+                    callID: event.id,
+                  }).pipe(Effect.orDie, Effect.asVoid),
+              }
+            : undefined,
+        )
         return
       }
       case "tool-error": {

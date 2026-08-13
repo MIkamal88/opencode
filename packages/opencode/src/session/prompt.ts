@@ -55,6 +55,7 @@ import { eq } from "drizzle-orm"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
+import { SessionReadReceipt } from "@opencode-ai/core/session/read-receipt"
 import { LLMEvent } from "@opencode-ai/llm"
 
 // @ts-ignore
@@ -140,6 +141,7 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const receipts = yield* SessionReadReceipt.Service
     const { db } = database
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
@@ -320,64 +322,71 @@ const layer = Layer.effect(
       }
 
       let error: Error | undefined
+      let ownership: Truncate.Ownership | undefined
       const taskAbort = new AbortController()
-      const result = yield* taskTool
-        .execute(taskArgs, {
-          agent: task.agent,
-          messageID: assistantMessage.id,
-          sessionID,
-          abort: taskAbort.signal,
-          callID: part.callID,
-          extra: { bypassAgentCheck: true, promptOps },
-          messages: msgs,
-          metadata: (val: { title?: string; metadata?: Record<string, any> }) =>
-            Effect.gen(function* () {
-              part = yield* sessions.updatePart({
-                ...part,
-                type: "tool",
-                state: { ...part.state, ...val },
-              } satisfies SessionV1.ToolPart)
-            }),
-          ask: (req: any) =>
-            permission
-              .ask({
-                ...req,
-                sessionID,
-                ruleset: Permission.merge(taskAgent.permission, session.permission ?? []),
-              })
-              .pipe(Effect.orDie),
-        })
-        .pipe(
-          Effect.catchCause((cause) => {
-            const defect = Cause.squash(cause)
-            error = defect instanceof Error ? defect : new Error(String(defect))
-            return Effect.logError("subtask execution failed", {
-              error,
+      const result = yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const result = yield* restore(
+            taskTool.execute(taskArgs, {
               agent: task.agent,
-              description: task.description,
-            })
-          }),
-          Effect.onInterrupt(() =>
-            Effect.gen(function* () {
-              taskAbort.abort()
-              assistantMessage.finish = "tool-calls"
-              assistantMessage.time.completed = Date.now()
-              yield* sessions.updateMessage(assistantMessage)
-              if (part.state.status === "running") {
-                yield* sessions.updatePart({
-                  ...part,
-                  state: {
-                    status: "error",
-                    error: "Cancelled",
-                    time: { start: part.state.time.start, end: Date.now() },
-                    metadata: part.state.metadata,
-                    input: part.state.input,
-                  },
-                } satisfies SessionV1.ToolPart)
-              }
+              messageID: assistantMessage.id,
+              sessionID,
+              abort: taskAbort.signal,
+              callID: part.callID,
+              extra: { bypassAgentCheck: true, promptOps },
+              messages: msgs,
+              metadata: (val: { title?: string; metadata?: Record<string, any> }) =>
+                Effect.gen(function* () {
+                  part = yield* sessions.updatePart({
+                    ...part,
+                    type: "tool",
+                    state: { ...part.state, ...val },
+                  } satisfies SessionV1.ToolPart)
+                }),
+              ask: (req: any) =>
+                permission
+                  .ask({
+                    ...req,
+                    sessionID,
+                    ruleset: Permission.merge(taskAgent.permission, session.permission ?? []),
+                  })
+                  .pipe(Effect.orDie),
             }),
-          ),
-        )
+          )
+          ownership = Tool.takeOwnership(result)
+          return result
+        }),
+      ).pipe(
+        Effect.catchCause((cause) => {
+          const defect = Cause.squash(cause)
+          error = defect instanceof Error ? defect : new Error(String(defect))
+          return Effect.logError("subtask execution failed", {
+            error,
+            agent: task.agent,
+            description: task.description,
+          })
+        }),
+        Effect.onInterrupt(() =>
+          Effect.gen(function* () {
+            taskAbort.abort()
+            assistantMessage.finish = "tool-calls"
+            assistantMessage.time.completed = Date.now()
+            yield* sessions.updateMessage(assistantMessage)
+            if (part.state.status === "running") {
+              yield* sessions.updatePart({
+                ...part,
+                state: {
+                  status: "error",
+                  error: "Cancelled",
+                  time: { start: part.state.time.start, end: Date.now() },
+                  metadata: part.state.metadata,
+                  input: part.state.input,
+                },
+              } satisfies SessionV1.ToolPart)
+            }
+          }),
+        ),
+      )
 
       const attachments = result?.attachments?.map((attachment) => ({
         ...attachment,
@@ -386,30 +395,54 @@ const layer = Layer.effect(
         messageID: assistantMessage.id,
       }))
 
-      yield* plugin.trigger(
-        "tool.execute.after",
-        { tool: TaskTool.id, sessionID, callID: part.id, args: taskArgs },
-        result,
-      )
+      const completion = yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const hook = yield* restore(
+            plugin.trigger(
+              "tool.execute.after",
+              { tool: TaskTool.id, sessionID, callID: part.id, args: taskArgs },
+              result,
+            ),
+          ).pipe(Effect.exit)
+          if (Exit.isFailure(hook)) {
+            yield* ownership?.discard() ?? Effect.void
+            return yield* Effect.failCause(hook.cause)
+          }
 
-      assistantMessage.finish = "tool-calls"
-      assistantMessage.time.completed = Date.now()
-      yield* sessions.updateMessage(assistantMessage)
+          const settled = yield* Effect.gen(function* () {
+            assistantMessage.finish = "tool-calls"
+            assistantMessage.time.completed = Date.now()
+            yield* sessions.updateMessage(assistantMessage)
 
-      if (result && part.state.status === "running") {
-        yield* sessions.updatePart({
-          ...part,
-          state: {
-            status: "completed",
-            input: part.state.input,
-            title: result.title,
-            metadata: result.metadata,
-            output: result.output,
-            attachments,
-            time: { ...part.state.time, end: Date.now() },
-          },
-        } satisfies SessionV1.ToolPart)
-      }
+            if (result && part.state.status === "running") {
+              yield* sessions.updatePart({
+                ...part,
+                state: {
+                  status: "completed",
+                  input: part.state.input,
+                  title: result.title,
+                  metadata: result.metadata,
+                  output: result.output,
+                  attachments,
+                  time: { ...part.state.time, end: Date.now() },
+                },
+              } satisfies SessionV1.ToolPart)
+            }
+          }).pipe(Effect.exit)
+          if (Exit.isFailure(settled)) {
+            const stored = yield* sessions
+              .getPart({ partID: part.id, messageID: part.messageID, sessionID: part.sessionID })
+              .pipe(Effect.exit)
+            const committed =
+              Exit.isSuccess(stored) && stored.value?.type === "tool" && stored.value.state.status === "completed"
+            if (committed || Exit.isFailure(stored)) yield* ownership?.retain() ?? Effect.void
+            else yield* ownership?.discard() ?? Effect.void
+            return yield* Effect.failCause(settled.cause)
+          }
+          yield* ownership?.retain() ?? Effect.void
+        }),
+      ).pipe(Effect.exit)
+      if (Exit.isFailure(completion)) return yield* Effect.failCause(completion.cause)
 
       if (!result) {
         yield* sessions.updatePart({
@@ -1231,6 +1264,7 @@ const layer = Layer.effect(
               bypassAgentCheck,
               messages: msgs,
               promptOps,
+              receipts,
             }).pipe(
               Effect.provideService(Plugin.Service, plugin),
               Effect.provideService(Permission.Service, permission),
@@ -1627,6 +1661,7 @@ export const node = LayerNode.make({
     EventV2Bridge.node,
     RuntimeFlags.node,
     Database.node,
+    SessionReadReceipt.node,
   ],
 })
 

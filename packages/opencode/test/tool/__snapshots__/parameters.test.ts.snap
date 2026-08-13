@@ -46,30 +46,100 @@ exports[`tool parameters JSON Schema (wire shape) bash 1`] = `
 exports[`tool parameters JSON Schema (wire shape) edit 1`] = `
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "properties": {
-    "filePath": {
-      "description": "The absolute path to the file to modify",
-      "type": "string",
+  "anyOf": [
+    {
+      "properties": {
+        "edits": {
+          "not": {},
+        },
+        "filePath": {
+          "description": "The absolute path to the file to modify",
+          "type": "string",
+        },
+        "newString": {
+          "description": "The text to replace it with (must be different from oldString)",
+          "type": "string",
+        },
+        "oldString": {
+          "description": "The text to replace",
+          "type": "string",
+        },
+        "replaceAll": {
+          "description": "Replace all occurrences of oldString (default false)",
+          "type": "boolean",
+        },
+      },
+      "required": [
+        "filePath",
+        "oldString",
+        "newString",
+      ],
+      "type": "object",
     },
-    "newString": {
-      "description": "The text to replace it with (must be different from oldString)",
-      "type": "string",
+    {
+      "properties": {
+        "edits": {
+          "description": "Disjoint replacements matched against the same original file snapshot",
+          "items": {
+            "properties": {
+              "newString": {
+                "description": "The replacement text",
+                "type": "string",
+              },
+              "oldString": {
+                "description": "The text to replace in the original file snapshot",
+                "type": "string",
+              },
+            },
+            "required": [
+              "oldString",
+              "newString",
+            ],
+            "type": "object",
+          },
+          "minItems": 1,
+          "prefixItems": [
+            {
+              "properties": {
+                "newString": {
+                  "description": "The replacement text",
+                  "type": "string",
+                },
+                "oldString": {
+                  "description": "The text to replace in the original file snapshot",
+                  "type": "string",
+                },
+              },
+              "required": [
+                "oldString",
+                "newString",
+              ],
+              "type": "object",
+            },
+          ],
+          "type": "array",
+        },
+        "filePath": {
+          "description": "The absolute path to the file to modify",
+          "type": "string",
+        },
+        "newString": {
+          "not": {},
+        },
+        "oldString": {
+          "not": {},
+        },
+        "replaceAll": {
+          "not": {},
+        },
+      },
+      "required": [
+        "filePath",
+        "edits",
+      ],
+      "type": "object",
     },
-    "oldString": {
-      "description": "The text to replace",
-      "type": "string",
-    },
-    "replaceAll": {
-      "description": "Replace all occurrences of oldString (default false)",
-      "type": "boolean",
-    },
-  },
-  "required": [
-    "filePath",
-    "oldString",
-    "newString",
   ],
-  "type": "object",
 }
 `;
 

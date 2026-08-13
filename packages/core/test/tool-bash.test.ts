@@ -2,7 +2,7 @@ import fs from "fs/promises"
 import { realpathSync } from "node:fs"
 import path from "path"
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer } from "effect"
+import { Duration, Effect, Layer } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Config } from "@opencode-ai/core/config"
@@ -28,7 +28,7 @@ const runs: Array<{
   readonly command: string
   readonly cwd?: string
   readonly shell?: string | boolean
-  readonly options?: AppProcess.RunOptions
+  readonly options?: AppProcess.RunOptions | AppProcess.RunCaptureOptions
 }> = []
 let denyAction: string | undefined
 let result: AppProcess.RunResult = {
@@ -40,6 +40,21 @@ let result: AppProcess.RunResult = {
   outputTruncated: false,
   stdoutTruncated: false,
   stderrTruncated: false,
+}
+let captureResult: AppProcess.RunCaptureResult = {
+  command: "mock",
+  exitCode: 0,
+  timeout: false,
+  capture: {
+    tail: "hello\n",
+    rawBytes: 6,
+    displayBytes: 6,
+    totalLines: 1,
+    retainedDisplayBytes: 6,
+    startLine: 1,
+    endLine: 1,
+    byteLimited: false,
+  },
 }
 let runFailure: AppProcess.AppProcessError | undefined
 let afterPermission = (_input: PermissionV2.AssertInput): Effect.Effect<void> => Effect.void
@@ -70,6 +85,16 @@ const appProcess = Layer.succeed(
         runs.push({ command: command.command, cwd: command.options.cwd, shell: command.options.shell, options })
         return runFailure ? Effect.fail(runFailure) : Effect.succeed(result)
       }),
+    runCapture: (
+      command: ChildProcess.Command,
+      _capture: ToolOutputStore.Capture,
+      options?: AppProcess.RunCaptureOptions,
+    ) =>
+      Effect.suspend(() => {
+        if (command._tag !== "StandardCommand") throw new Error("expected standard command")
+        runs.push({ command: command.command, cwd: command.options.cwd, shell: command.options.shell, options })
+        return runFailure ? Effect.fail(runFailure) : Effect.succeed(captureResult)
+      }),
   } as unknown as AppProcess.Interface),
 )
 const config = Layer.succeed(
@@ -94,6 +119,21 @@ const reset = () => {
     outputTruncated: false,
     stdoutTruncated: false,
     stderrTruncated: false,
+  }
+  captureResult = {
+    command: "mock",
+    exitCode: 0,
+    timeout: false,
+    capture: {
+      tail: "hello\n",
+      rawBytes: 6,
+      displayBytes: 6,
+      totalLines: 1,
+      retainedDisplayBytes: 6,
+      startLine: 1,
+      endLine: 1,
+      byteLimited: false,
+    },
   }
 }
 
@@ -168,10 +208,7 @@ describe("BashTool", () => {
               },
             })
             expect(runs).toMatchObject([{ command: "pwd", cwd: realpathSync(tmp.path) }])
-            expect(runs[0]?.options).toMatchObject({
-              combineOutput: true,
-              maxOutputBytes: BashTool.MAX_CAPTURE_BYTES,
-            })
+            expect(runs[0]?.options).toMatchObject({ timeout: Duration.millis(BashTool.DEFAULT_TIMEOUT_MS) })
             expect(assertions).toMatchObject([{ sessionID, action: "bash", resources: ["pwd"], save: ["pwd"] }])
           }),
         )
@@ -348,7 +385,11 @@ describe("BashTool", () => {
       Effect.promise(() => tmpdir()),
       (tmp) => {
         reset()
-        result = { ...result, exitCode: 7, output: Buffer.from("HEAD full output TAIL") }
+        captureResult = {
+          ...captureResult,
+          exitCode: 7,
+          capture: { ...captureResult.capture, tail: "HEAD full output TAIL", rawBytes: 21, displayBytes: 21 },
+        }
         return withTool(tmp.path, (registry) => settleTool(registry, call({ command: "false" }, "call-overflow"))).pipe(
           Effect.andThen((settled) =>
             Effect.sync(() => {
@@ -369,21 +410,39 @@ describe("BashTool", () => {
     ),
   )
 
-  it.live("surfaces bounded process-capture truncation", () =>
+  it.live("reuses a managed process artifact without exposing its path in structured output", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => tmpdir()),
       (tmp) => {
         reset()
-        result = { ...result, outputTruncated: true }
+        const outputPath = path.join(tmp.path, "managed-output")
+        captureResult = {
+          ...captureResult,
+          capture: {
+            ...captureResult.capture,
+            path: outputPath,
+            tail: "late output",
+            rawBytes: 100_000,
+            displayBytes: 100_000,
+            totalLines: 3_000,
+            startLine: 2_999,
+            endLine: 3_000,
+            retainedDisplayBytes: 11,
+          },
+        }
         return withTool(tmp.path, (registry) => settleTool(registry, call({ command: "verbose" }))).pipe(
           Effect.andThen((settled) =>
             Effect.sync(() => {
               expect(settled.output?.structured).toMatchObject({ truncated: true })
-              expect(settled.output?.content[0]).toMatchObject({
-                type: "text",
-                text: expect.stringContaining("output capture truncated"),
-              })
+              const content = settled.output?.content[0]
+              expect(content?.type).toBe("text")
+              if (content?.type !== "text") throw new Error("expected text output")
+              expect(content.text).toContain(`Full output saved to: ${outputPath}`)
+              expect(content.text).toContain("Use read with path")
+              expect(content.text).not.toContain("grep.path")
               expect(settled.output?.structured).not.toHaveProperty("resource")
+              expect(settled.output?.structured).not.toHaveProperty("outputPath")
+              expect(settled.outputPaths).toEqual([outputPath])
             }),
           ),
         )
@@ -397,7 +456,12 @@ describe("BashTool", () => {
       Effect.promise(() => tmpdir()),
       (tmp) => {
         reset()
-        runFailure = new AppProcess.AppProcessError({ command: "sleep", cause: new Error("Timed out") })
+        captureResult = {
+          ...captureResult,
+          exitCode: undefined,
+          timeout: true,
+          capture: { ...captureResult.capture, tail: "partial output", rawBytes: 14, displayBytes: 14 },
+        }
         return withTool(tmp.path, (registry) => settleTool(registry, call({ command: "sleep 60", timeout: 10 }))).pipe(
           Effect.andThen((settled) =>
             Effect.sync(() => {
@@ -429,8 +493,6 @@ test("keeps locked deferred parity TODOs visible", async () => {
     "Add durable/live progress metadata streaming for long-running commands once V2 tool invocation progress context is wired.",
     "Persist background job status and define restart recovery before exposing remote observation.",
     "Revisit process-group cleanup and platform coverage with shell-specific tests if current AppProcess semantics do not fully cover it.",
-    "Revisit binary output handling if stdout/stderr decoding is text-only.",
-    "Stream full shell output into managed storage while retaining only a bounded in-memory preview.",
   ]) {
     expect(source).toContain(`TODO: ${todo}`)
   }

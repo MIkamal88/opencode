@@ -72,7 +72,7 @@ const prepareOnce = Effect.fnUntraced(function* (
   yield* events.publish(
     SessionEvent.ContextUpdated,
     { sessionID, messageID: SessionMessage.ID.create(), timestamp: yield* DateTime.now, text: result.text },
-    { commit: () => advance(db, sessionID, result.snapshot).pipe(Effect.orDie) },
+    { commit: (_seq, tx) => advance(tx, sessionID, result.snapshot).pipe(Effect.orDie) },
   )
   return { baseline: stored.baseline, baselineSeq: stored.baseline_seq }
 })
@@ -159,7 +159,7 @@ const replace = Effect.fnUntraced(function* (
 })
 
 const advance = Effect.fnUntraced(function* (
-  db: DatabaseService,
+  db: Database.Client,
   sessionID: SessionSchema.ID,
   snapshot: SystemContext.Snapshot,
 ) {

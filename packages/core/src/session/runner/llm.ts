@@ -226,8 +226,11 @@ const layer = Layer.effect(
         snapshot: startSnapshot,
       })
       const withPublication = Semaphore.makeUnsafe(1).withPermit
-      const publish = (event: LLMEvent, outputPaths: ReadonlyArray<string> = []) =>
-        withPublication(publisher.publish(event, outputPaths))
+      const publish = (
+        event: LLMEvent,
+        outputPaths: ReadonlyArray<string> = [],
+        receipt?: import("../../tool/trusted-receipt").Receipt,
+      ) => withPublication(publisher.publish(event, outputPaths, receipt))
       let overflowFailure: ProviderErrorEvent | undefined
       const providerStream = llm.stream(request).pipe(
         Stream.runForEach((event) =>
@@ -257,14 +260,26 @@ const layer = Layer.effect(
                 }),
               ).pipe(
                 Effect.flatMap((settlement) =>
-                  publish(
-                    LLMEvent.toolResult({
-                      id: event.id,
-                      name: event.name,
-                      result: settlement.result,
-                      output: settlement.output,
+                  Effect.uninterruptible(
+                    Effect.gen(function* () {
+                      const published = yield* publish(
+                        LLMEvent.toolResult({
+                          id: event.id,
+                          name: event.name,
+                          result: settlement.result,
+                          output: settlement.output,
+                        }),
+                        settlement.outputPaths ?? [],
+                        settlement.receipt,
+                      ).pipe(Effect.exit)
+                      if (published._tag === "Failure") {
+                        yield* Effect.forEach(settlement.discards ?? [], (discard) => discard(), { discard: true })
+                        yield* Effect.forEach(settlement.releases ?? [], (release) => release(), { discard: true })
+                        return yield* Effect.failCause(published.cause)
+                      }
+                      yield* Effect.forEach(settlement.retains ?? [], (retain) => retain(), { discard: true })
+                      yield* Effect.forEach(settlement.releases ?? [], (release) => release(), { discard: true })
                     }),
-                    settlement.outputPaths ?? [],
                   ),
                 ),
               ),

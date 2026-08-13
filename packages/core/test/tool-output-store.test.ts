@@ -11,6 +11,7 @@ import { SessionV2 } from "@opencode-ai/core/session"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { testEffect } from "./lib/effect"
 import { tmpdir } from "./fixture/tmpdir"
+import fsNative from "node:fs/promises"
 
 const sessionID = SessionV2.ID.make("ses_tool_output_store")
 
@@ -45,6 +46,142 @@ const withStore = <A, E, R>(
 const it = testEffect(Layer.empty)
 
 describe("ToolOutputStore", () => {
+  it.live(
+    "captures early and late raw bytes losslessly beyond one MiB with one lazy artifact",
+    () =>
+      withStore(({ root, store }) =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const capture = yield* store.capture()
+            const early = Buffer.from("EARLY-" + "x".repeat(700_000))
+            const late = Buffer.from("y".repeat(700_000) + "-LATE")
+            yield* capture.write(early)
+            yield* capture.write(late)
+            const result = yield* capture.finish()
+
+            expect(result.path).toBeDefined()
+            expect(yield* Effect.promise(() => fsNative.readFile(result.path!))).toEqual(Buffer.concat([early, late]))
+            expect(result.rawBytes).toBe(early.length + late.length)
+            expect(result.displayBytes).toBe(result.rawBytes)
+            expect(result.tail.endsWith("-LATE")).toBe(true)
+            expect(
+              (yield* Effect.promise(() => fsNative.readdir(path.join(root, ToolOutputStore.MANAGED_DIRECTORY))))
+                .length,
+            ).toBe(1)
+            if (result.retain) yield* result.retain()
+          }),
+        ),
+      ),
+    15_000,
+  )
+
+  it.live("decodes split and invalid UTF-8 safely while preserving exact raw bytes", () =>
+    withStore(({ store }) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const capture = yield* store.capture()
+          const prefix = Buffer.alloc(ToolOutputStore.MAX_BYTES, 0x61)
+          const chunks = [prefix, Uint8Array.of(0xe2), Uint8Array.of(0x82, 0xac, 0xff, 0x0a, 0x7a)]
+          yield* Effect.forEach(chunks, capture.write, { discard: true })
+          const result = yield* capture.finish()
+
+          expect(result.path).toBeDefined()
+          expect(yield* Effect.promise(() => fsNative.readFile(result.path!))).toEqual(
+            Buffer.concat(chunks.map(Buffer.from)),
+          )
+          expect(result.tail).toContain("€�\nz")
+          expect(Buffer.from(result.tail, "utf8").toString("utf8")).toBe(result.tail)
+          expect(result.rawBytes).toBe(prefix.length + 6)
+          expect(result.displayBytes).toBe(prefix.length + Buffer.byteLength("€�\nz"))
+          expect(result.totalLines).toBe(2)
+          if (result.retain) yield* result.retain()
+        }),
+      ),
+    ),
+  )
+
+  it.live("bounds a giant logical line with exact ranges", () =>
+    withStore(({ store }) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const capture = yield* store.capture()
+          yield* capture.write(Buffer.from("g".repeat(ToolOutputStore.MAX_BYTES * 3)))
+          const result = yield* capture.finish()
+          expect(result.totalLines).toBe(1)
+          expect(result.startLine).toBe(1)
+          expect(result.endLine).toBe(1)
+          expect(result.byteLimited).toBe(true)
+          expect(result.retainedDisplayBytes).toBe(ToolOutputStore.MAX_BYTES)
+          if (result.retain) yield* result.retain()
+        }),
+      ),
+    ),
+  )
+
+  it.live("keeps total line count and displayed tail range after capture eviction", () =>
+    withStore(({ store }) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const capture = yield* store.capture()
+          const lines = Array.from({ length: ToolOutputStore.MAX_LINES + 500 }, (_, index) => `line-${index + 1}\n`)
+          yield* capture.write(Buffer.from(lines.join("")))
+          const result = yield* capture.finish()
+          expect(result.totalLines).toBe(ToolOutputStore.MAX_LINES + 500)
+          expect(result.startLine).toBeGreaterThan(500)
+          expect(result.endLine).toBe(ToolOutputStore.MAX_LINES + 500)
+          expect(result.tail).toContain("line-2500")
+          if (result.retain) yield* result.retain()
+        }),
+      ),
+    ),
+  )
+
+  it.live("removes an unretained capture artifact when discarded", () =>
+    withStore(({ store, fs }) =>
+      Effect.gen(function* () {
+        const capture = yield* store.capture()
+        yield* capture.write(Buffer.alloc(ToolOutputStore.MAX_BYTES + 1))
+        const result = yield* capture.finish()
+        expect(result.path).toBeDefined()
+        yield* capture.discard()
+        expect(yield* fs.exists(result.path!)).toBe(false)
+      }),
+    ),
+  )
+
+  it.live("retains a capture artifact only after explicit settlement ownership", () =>
+    withStore(({ store, fs }) =>
+      Effect.gen(function* () {
+        const capture = yield* store.capture()
+        yield* capture.write(Buffer.alloc(ToolOutputStore.MAX_BYTES + 1))
+        const result = yield* capture.finish()
+        if (result.retain) yield* result.retain()
+        yield* capture.discard()
+        expect(yield* fs.exists(result.path!)).toBe(true)
+      }),
+    ),
+  )
+
+  if (process.platform !== "win32") {
+    it.live("creates private managed directories and files", () =>
+      withStore(({ root, store }) =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const capture = yield* store.capture()
+            yield* capture.write(Buffer.alloc(ToolOutputStore.MAX_BYTES + 1))
+            const result = yield* capture.finish()
+            expect(
+              (yield* Effect.promise(() => fsNative.stat(path.join(root, ToolOutputStore.MANAGED_DIRECTORY)))).mode &
+                0o777,
+            ).toBe(0o700)
+            expect((yield* Effect.promise(() => fsNative.stat(result.path!))).mode & 0o777).toBe(0o600)
+            if (result.retain) yield* result.retain()
+          }),
+        ),
+      ),
+    )
+  }
+
   it.live("bounds the provider-facing text channel with one managed file", () =>
     withStore(({ store, fs }) =>
       Effect.gen(function* () {
@@ -63,7 +200,13 @@ describe("ToolOutputStore", () => {
         })
         expect(result.output.structured).toEqual({ kind: "report" })
         expect(result.outputPaths).toHaveLength(1)
-        expect(yield* fs.readFileString(result.outputPaths[0])).toBe(first + second)
+        expect(JSON.parse(yield* fs.readFileString(result.outputPaths[0]))).toEqual({
+          structured: { kind: "report" },
+          content: [
+            { type: "text", text: first },
+            { type: "text", text: second },
+          ],
+        })
         if (result.output.content[0]?.type !== "text") throw new Error("expected text preview")
         expect(Buffer.byteLength(result.output.content[0].text)).toBeLessThanOrEqual(ToolOutputStore.MAX_BYTES)
       }),
@@ -75,7 +218,7 @@ describe("ToolOutputStore", () => {
       Effect.gen(function* () {
         const structured = { text: "x".repeat(ToolOutputStore.MAX_BYTES) }
         const result = yield* store.bound({ sessionID, toolCallID: "call-json", output: { structured, content: [] } })
-        expect(result.output.structured).toEqual(structured)
+        expect(result.output.structured).toEqual({ truncated: true })
         expect(result.outputPaths).toHaveLength(1)
         expect(JSON.parse(yield* fs.readFileString(result.outputPaths[0]))).toEqual(structured)
         expect(result.output.content).toHaveLength(1)
@@ -83,8 +226,22 @@ describe("ToolOutputStore", () => {
     ),
   )
 
-  it.live("preserves native media and structured metadata without applying a settlement media limit", () =>
-    withStore(({ store }) =>
+  it.live("retains oversized structured data alongside projected text", () =>
+    withStore(({ store, fs }) =>
+      Effect.gen(function* () {
+        const output = {
+          structured: { payload: "s".repeat(ToolOutputStore.MAX_BYTES) },
+          content: [{ type: "text" as const, text: "summary" }],
+        }
+        const result = yield* store.bound({ sessionID, toolCallID: "call-structured-text", output })
+        expect(result.output.structured).toEqual({ truncated: true })
+        expect(JSON.parse(yield* fs.readFileString(result.outputPaths[0]))).toEqual(output)
+      }),
+    ),
+  )
+
+  it.live("bounds data URI media and retains the complete output once", () =>
+    withStore(({ root, store, fs }) =>
       Effect.gen(function* () {
         const data = "a".repeat(6 * 1024 * 1024)
         const result = yield* store.bound({
@@ -95,15 +252,16 @@ describe("ToolOutputStore", () => {
             content: [{ type: "file", uri: `data:image/png;base64,${data}`, mime: "image/png", name: "pixel.png" }],
           },
         })
-        expect(result.outputPaths).toEqual([])
+        expect(result.outputPaths).toHaveLength(1)
         expect(result.output.structured).toEqual({ caption: "pixel" })
         expect(result.output.content).toHaveLength(1)
-        expect(result.output.content[0]).toEqual({
-          type: "file",
-          uri: `data:image/png;base64,${data}`,
-          mime: "image/png",
-          name: "pixel.png",
+        expect(result.output.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("saved to") })
+        expect(JSON.parse(yield* fs.readFileString(result.outputPaths[0]))).toMatchObject({
+          content: [{ type: "file", uri: `data:image/png;base64,${data}` }],
         })
+        expect(
+          (yield* Effect.promise(() => fsNative.readdir(path.join(root, ToolOutputStore.MANAGED_DIRECTORY)))).length,
+        ).toBe(1)
       }),
     ),
   )
@@ -125,8 +283,10 @@ describe("ToolOutputStore", () => {
         })
 
         expect(result.output.structured).toEqual({ caption: "pixel" })
-        expect(result.output.content[1]).toEqual(media)
-        expect(yield* fs.readFileString(result.outputPaths[0])).toBe(text)
+        expect(result.output.content).toHaveLength(1)
+        expect(JSON.parse(yield* fs.readFileString(result.outputPaths[0]))).toMatchObject({
+          content: [{ type: "text", text }, media],
+        })
       }),
     ),
   )

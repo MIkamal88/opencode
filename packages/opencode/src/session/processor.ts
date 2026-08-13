@@ -24,7 +24,9 @@ import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
+import { EventV2 } from "@opencode-ai/core/event"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
+import type { Ownership } from "@/tool/truncate"
 
 const DOOM_LOOP_THRESHOLD = 3
 export type Result = "compact" | "stop" | "continue"
@@ -35,6 +37,7 @@ export interface Handle {
     toolCallID: string,
     update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
   ) => Effect.Effect<SessionV1.ToolPart | undefined>
+  readonly ownToolCall: (toolCallID: string, ownership: Ownership) => Effect.Effect<void>
   readonly completeToolCall: (
     toolCallID: string,
     output: {
@@ -43,6 +46,7 @@ export interface Handle {
       output: string
       attachments?: SessionV1.FilePart[]
     },
+    commit?: NonNullable<EventV2.PublishOptions["commit"]>,
   ) => Effect.Effect<void>
   readonly process: (streamInput: LLM.StreamInput) => Effect.Effect<Result>
 }
@@ -62,10 +66,14 @@ type ToolCall = {
   messageID: SessionV1.ToolPart["messageID"]
   sessionID: SessionV1.ToolPart["sessionID"]
   done: Deferred.Deferred<void>
+  settling?: boolean
 }
 
 interface ProcessorContext extends Input {
   toolcalls: Record<string, ToolCall>
+  ownerships: Record<string, Ownership>
+  settledToolCalls: Set<string>
+  closed: boolean
   shouldBreak: boolean
   snapshot: string | undefined
   blocked: boolean
@@ -105,6 +113,9 @@ const layer = Layer.effect(
         sessionID: input.sessionID,
         model: input.model,
         toolcalls: {},
+        ownerships: {},
+        settledToolCalls: new Set(),
+        closed: false,
         shouldBreak: false,
         snapshot: initialSnapshot,
         blocked: false,
@@ -120,10 +131,24 @@ const layer = Layer.effect(
           aborted,
         })
 
-      const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
-        const done = ctx.toolcalls[toolCallID]?.done
+      const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (
+        toolCallID: string,
+        disposition: "retain" | "discard" = "discard",
+      ) {
+        const call = ctx.toolcalls[toolCallID]
+        const ownership = ctx.ownerships[toolCallID]
+        delete ctx.ownerships[toolCallID]
+        const done = call?.done
         delete ctx.toolcalls[toolCallID]
+        ctx.settledToolCalls.add(toolCallID)
+        if (ownership) yield* ownership[disposition]()
         if (done) yield* Deferred.succeed(done, undefined).pipe(Effect.ignore)
+      })
+
+      const discardOwnership = Effect.fn("SessionProcessor.discardOwnership")(function* (toolCallID: string) {
+        const ownership = ctx.ownerships[toolCallID]
+        delete ctx.ownerships[toolCallID]
+        if (ownership) yield* ownership.discard()
       })
 
       const readToolCall = Effect.fn("SessionProcessor.readToolCall")(function* (toolCallID: string) {
@@ -135,7 +160,7 @@ const layer = Layer.effect(
           sessionID: call.sessionID,
         })
         if (!part || part.type !== "tool") {
-          delete ctx.toolcalls[toolCallID]
+          yield* settleToolCall(toolCallID)
           return undefined
         }
         return { call, part }
@@ -157,6 +182,35 @@ const layer = Layer.effect(
         return part
       })
 
+      const ownToolCall = Effect.fn("SessionProcessor.ownToolCall")(function* (
+        toolCallID: string,
+        ownership: Ownership,
+      ) {
+        return yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            if (ctx.closed || ctx.settledToolCalls.has(toolCallID) || ctx.ownerships[toolCallID]) {
+              yield* ownership.discard()
+              return
+            }
+            const call = ctx.toolcalls[toolCallID]
+            if (!call) {
+              ctx.ownerships[toolCallID] = ownership
+              return
+            }
+            const match = yield* readToolCall(toolCallID).pipe(Effect.exit)
+            if (Exit.isFailure(match)) {
+              yield* ownership.discard()
+              return yield* Effect.failCause(match.cause)
+            }
+            if (!match.value || match.value.part.state.status !== "running") {
+              yield* ownership.discard()
+              return
+            }
+            ctx.ownerships[toolCallID] = ownership
+          }),
+        )
+      })
+
       const completeToolCall = Effect.fn("SessionProcessor.completeToolCall")(function* (
         toolCallID: string,
         output: {
@@ -165,43 +219,83 @@ const layer = Layer.effect(
           output: string
           attachments?: SessionV1.FilePart[]
         },
+        commit?: NonNullable<EventV2.PublishOptions["commit"]>,
       ) {
-        const match = yield* readToolCall(toolCallID)
-        if (!match || match.part.state.status !== "running") return
-        yield* session.updatePart({
-          ...match.part,
-          state: {
-            status: "completed",
-            input: match.part.state.input,
-            output: output.output,
-            metadata: output.metadata,
-            title: output.title,
-            time: { start: match.part.state.time.start, end: Date.now() },
-            attachments: output.attachments,
-          },
-        })
-        yield* settleToolCall(toolCallID)
+        return yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            const match = yield* readToolCall(toolCallID)
+            if (!match) return
+            if (match.part.state.status !== "running") {
+              yield* settleToolCall(toolCallID)
+              return
+            }
+            match.call.settling = true
+            const published = yield* session
+              .updatePart(
+                {
+                  ...match.part,
+                  state: {
+                    status: "completed",
+                    input: match.part.state.input,
+                    output: output.output,
+                    metadata: output.metadata,
+                    title: output.title,
+                    time: { start: match.part.state.time.start, end: Date.now() },
+                    attachments: output.attachments,
+                  },
+                },
+                commit,
+              )
+              .pipe(Effect.exit)
+            if (Exit.isFailure(published)) {
+              const stored = yield* session
+                .getPart({
+                  partID: match.call.partID,
+                  messageID: match.call.messageID,
+                  sessionID: match.call.sessionID,
+                })
+                .pipe(Effect.exit)
+              const committed =
+                Exit.isSuccess(stored) && stored.value?.type === "tool" && stored.value.state.status === "completed"
+              match.call.settling = false
+              if (committed || Exit.isFailure(stored)) yield* settleToolCall(toolCallID, "retain")
+              else yield* discardOwnership(toolCallID)
+              return yield* Effect.failCause(published.cause)
+            }
+            match.call.settling = false
+            yield* settleToolCall(toolCallID, "retain")
+          }),
+        )
       })
 
       const failToolCall = Effect.fn("SessionProcessor.failToolCall")(function* (toolCallID: string, error: unknown) {
-        const match = yield* readToolCall(toolCallID)
-        if (!match || match.part.state.status !== "running") return false
-        yield* session.updatePart({
-          ...match.part,
-          state: {
-            status: "error",
-            input: match.part.state.input,
-            error: errorMessage(error),
-            // Keep metadata streamed while running so failures retain progress detail (e.g. execute's child calls).
-            metadata: match.part.state.metadata,
-            time: { start: match.part.state.time.start, end: Date.now() },
-          },
-        })
-        if (error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError) {
-          ctx.blocked = ctx.shouldBreak
-        }
-        yield* settleToolCall(toolCallID)
-        return true
+        return yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            const match = yield* readToolCall(toolCallID)
+            if (!match) return false
+            if (match.part.state.status !== "running") {
+              yield* settleToolCall(toolCallID)
+              return false
+            }
+            yield* discardOwnership(toolCallID)
+            yield* session.updatePart({
+              ...match.part,
+              state: {
+                status: "error",
+                input: match.part.state.input,
+                error: errorMessage(error),
+                // Keep metadata streamed while running so failures retain progress detail (e.g. execute's child calls).
+                metadata: match.part.state.metadata,
+                time: { start: match.part.state.time.start, end: Date.now() },
+              },
+            })
+            if (error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError) {
+              ctx.blocked = ctx.shouldBreak
+            }
+            yield* settleToolCall(toolCallID)
+            return true
+          }),
+        )
       })
 
       const finishReasoning = Effect.fn("SessionProcessor.finishReasoning")(function* (reasoningID: string) {
@@ -575,9 +669,17 @@ const layer = Layer.effect(
           { concurrency: "unbounded" },
         )
 
+        ctx.closed = true
+        yield* Effect.forEach(
+          Object.keys(ctx.ownerships).filter((toolCallID) => !ctx.toolcalls[toolCallID]?.settling),
+          discardOwnership,
+          { discard: true },
+        )
+
         for (const toolCallID of Object.keys(ctx.toolcalls)) {
           const match = yield* readToolCall(toolCallID)
           if (!match) continue
+          if (match.call.settling) continue
           const part = match.part
           const end = Date.now()
           const metadata = "metadata" in part.state && isRecord(part.state.metadata) ? part.state.metadata : {}
@@ -591,8 +693,13 @@ const layer = Layer.effect(
               time: { start: "time" in part.state ? part.state.time.start : end, end },
             },
           })
+          yield* settleToolCall(toolCallID)
         }
-        ctx.toolcalls = {}
+        yield* Effect.forEach(
+          Object.keys(ctx.ownerships).filter((toolCallID) => !ctx.toolcalls[toolCallID]?.settling),
+          discardOwnership,
+          { discard: true },
+        )
         ctx.assistantMessage.time.completed = Date.now()
         yield* session.updateMessage(ctx.assistantMessage)
       })
@@ -691,6 +798,7 @@ const layer = Layer.effect(
           return ctx.assistantMessage
         },
         updateToolCall,
+        ownToolCall,
         completeToolCall,
         process,
       } satisfies Handle

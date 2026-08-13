@@ -54,6 +54,8 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { MCP } from "@/mcp"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { McpCatalog } from "@/mcp/catalog"
+import { FileMutationState } from "./file-mutation-state"
+import { SessionReadReceipt } from "@opencode-ai/core/session/read-receipt"
 
 export function webSearchEnabled(providerID: ProviderV2.ID, flags = { exa: false, parallel: false }) {
   return providerID === ProviderV2.ID.opencode || flags.exa || flags.parallel
@@ -141,7 +143,11 @@ const layer = Layer.effect(
                 // function for the plugin to make sure context persists
                 const bridge = yield* EffectBridge.make()
                 const pluginCtx: PluginToolContext = {
-                  ...toolCtx,
+                  sessionID: toolCtx.sessionID,
+                  messageID: toolCtx.messageID,
+                  agent: toolCtx.agent,
+                  abort: toolCtx.abort,
+                  metadata: (input) => void bridge.fork(toolCtx.metadata(input)),
                   ask: (req) => bridge.promise(toolCtx.ask(req)),
                   directory: ctx.directory,
                   worktree: ctx.worktree,
@@ -150,18 +156,24 @@ const layer = Layer.effect(
                 const output = typeof result === "string" ? result : result.output
                 const metadata = typeof result === "string" ? {} : (result.metadata ?? {})
                 const attachments = typeof result === "string" ? undefined : result.attachments
-                const info = yield* agent.get(toolCtx.agent)
-                const out = yield* truncate.output(output, {}, info)
-                return {
-                  title: typeof result === "string" ? "" : (result.title ?? ""),
-                  output: out.truncated ? out.content : output,
-                  attachments,
-                  metadata: {
-                    ...metadata,
-                    truncated: out.truncated,
-                    ...(out.truncated && { outputPath: out.outputPath }),
-                  },
-                }
+                return yield* Effect.uninterruptibleMask((restore) =>
+                  Effect.gen(function* () {
+                    const info = yield* restore(agent.get(toolCtx.agent))
+                    const out = yield* truncate.output(output, {}, info)
+                    const outputResult = {
+                      title: typeof result === "string" ? "" : (result.title ?? ""),
+                      output: out.truncated ? out.content : output,
+                      attachments,
+                      metadata: {
+                        ...metadata,
+                        truncated: out.truncated,
+                        ...(out.truncated && { outputPath: out.outputPath }),
+                      },
+                    }
+                    if (!out.truncated) return outputResult
+                    return Tool.attachOwnership(outputResult, truncate.ownership(out.outputPath))
+                  }),
+                )
               }).pipe(
                 Effect.withSpan("Tool.execute", {
                   attributes: {
@@ -444,6 +456,8 @@ export const node = LayerNode.make({
     MCP.node,
     Database.node,
     Ripgrep.node,
+    FileMutationState.node,
+    SessionReadReceipt.node,
   ],
 })
 

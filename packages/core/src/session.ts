@@ -34,6 +34,7 @@ import { SessionEvent } from "./session/event"
 import { SessionInput } from "./session/input"
 import { Snapshot } from "./snapshot"
 import { SessionRevert } from "./session/revert"
+import { SessionReadReceipt } from "./session/read-receipt"
 import { Revert } from "@opencode-ai/schema/revert"
 import { FSUtil } from "./fs-util"
 import { SessionDurable } from "@opencode-ai/schema/durable-event-manifest"
@@ -185,6 +186,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const database = yield* Database.Service
+    const receipts = yield* SessionReadReceipt.Service
     const db = database.db
     const events = yield* EventV2.Service
     const projects = yield* ProjectV2.Service
@@ -436,6 +438,7 @@ const layer = Layer.effect(
           return yield* SessionRevert.stage({ session, messageID: input.messageID, files: input.files }).pipe(
             Effect.provideService(Database.Service, database),
             Effect.provideService(EventV2.Service, events),
+            Effect.provideService(SessionReadReceipt.Service, receipts),
             Effect.provide(locations.get(session.location)),
           )
         }),
@@ -443,6 +446,7 @@ const layer = Layer.effect(
           const session = yield* result.get(sessionID)
           yield* SessionRevert.clear(session).pipe(
             Effect.provideService(EventV2.Service, events),
+            Effect.provideService(SessionReadReceipt.Service, receipts),
             Effect.provide(locations.get(session.location)),
           )
         }),
@@ -482,5 +486,6 @@ export const node = makeGlobalNode({
     SessionStore.node,
     LocationServiceMap.node,
     SessionProjector.node,
+    SessionReadReceipt.node,
   ],
 })

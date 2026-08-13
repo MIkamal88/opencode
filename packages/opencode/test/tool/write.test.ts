@@ -15,8 +15,9 @@ import { SessionID, MessageID } from "../../src/session/schema"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
+import { FileMutationState } from "@/tool/file-mutation-state"
 
-const ctx = {
+const baseCtx = {
   sessionID: SessionID.make("ses_test-write-session"),
   messageID: MessageID.make("msg_test"),
   callID: "",
@@ -25,6 +26,30 @@ const ctx = {
   messages: [],
   metadata: () => Effect.void,
   ask: () => Effect.void,
+}
+
+const receiptContext = (content?: string) => {
+  const state = { digest: content ? new Bun.CryptoHasher("sha256").update(content).digest("hex") : undefined }
+  return {
+    ...baseCtx,
+    receipt: {
+      match: (input: { digest: string }) => Effect.succeed(state.digest === input.digest),
+      invalidate: () => Effect.sync(() => void (state.digest = undefined)),
+      settle: (input: { digest: string }) => Effect.sync(() => void (state.digest = input.digest)),
+      pending: () => undefined,
+    },
+    state,
+  }
+}
+
+const ctx = {
+  ...baseCtx,
+  receipt: {
+    match: () => Effect.succeed(true),
+    invalidate: () => Effect.void,
+    settle: () => Effect.void,
+    pending: () => undefined,
+  },
 }
 
 afterEach(async () => {
@@ -41,6 +66,7 @@ const it = testEffect(
       CrossSpawnSpawner.node,
       Truncate.node,
       Agent.node,
+      FileMutationState.node,
     ]),
   ),
 )
@@ -60,6 +86,16 @@ const run = Effect.fn("WriteToolTest.run")(function* (
 
 describe("tool.write", () => {
   describe("new file creation", () => {
+    it.instance("creates without an internal receipt channel", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "unavailable.txt")
+        yield* run({ filePath: filepath, content: "content" }, { ...ctx, receipt: undefined })
+
+        expect(yield* Effect.promise(() => fs.readFile(filepath, "utf-8"))).toBe("content")
+      }),
+    )
+
     it.instance("writes content to new file", () =>
       Effect.gen(function* () {
         const test = yield* TestInstance
@@ -94,9 +130,70 @@ describe("tool.write", () => {
         expect(content).toBe("relative content")
       }),
     )
+
+    it.instance("creates exclusively after permission approval", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "creation-race.txt")
+        const exit = yield* run(
+          { filePath: filepath, content: "agent" },
+          {
+            ...ctx,
+            ask: () => Effect.promise(() => fs.writeFile(filepath, "external")),
+          },
+        ).pipe(Effect.exit)
+
+        expect(exit._tag).toBe("Failure")
+        expect(yield* Effect.promise(() => fs.readFile(filepath, "utf-8"))).toBe("external")
+      }),
+    )
   })
 
   describe("existing file overwrite", () => {
+    it.instance("fails closed when the internal receipt channel is unavailable", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "unavailable-existing.txt")
+        yield* Effect.promise(() => fs.writeFile(filepath, "old", "utf-8"))
+        const exit = yield* run({ filePath: filepath, content: "new" }, { ...ctx, receipt: undefined }).pipe(
+          Effect.exit,
+        )
+
+        expect(exit._tag).toBe("Failure")
+        expect(yield* Effect.promise(() => fs.readFile(filepath, "utf-8"))).toBe("old")
+      }),
+    )
+    it.instance("requires a matching receipt and refreshes it after overwrite", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "receipt.txt")
+        yield* Effect.promise(() => fs.writeFile(filepath, "old", "utf-8"))
+        const next = receiptContext()
+        const missing = yield* run({ filePath: filepath, content: "new" }, next).pipe(Effect.exit)
+        expect(missing._tag).toBe("Failure")
+        next.state.digest = new Bun.CryptoHasher("sha256").update("old").digest("hex")
+        yield* run({ filePath: filepath, content: "new" }, next)
+        expect(next.state.digest).toBe(new Bun.CryptoHasher("sha256").update("new").digest("hex"))
+      }),
+    )
+    it.instance("revalidates bytes after permission approval", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "permission-race.txt")
+        yield* Effect.promise(() => fs.writeFile(filepath, "old", "utf-8"))
+        const next = receiptContext("old")
+        const exit = yield* run(
+          { filePath: filepath, content: "agent" },
+          {
+            ...next,
+            ask: () => Effect.promise(() => fs.writeFile(filepath, "external")),
+          },
+        ).pipe(Effect.exit)
+
+        expect(exit._tag).toBe("Failure")
+        expect(yield* Effect.promise(() => fs.readFile(filepath, "utf-8"))).toBe("external")
+      }),
+    )
     it.instance("overwrites existing file content", () =>
       Effect.gen(function* () {
         const test = yield* TestInstance
@@ -135,12 +232,14 @@ describe("tool.write", () => {
           const filepath = path.join(test.directory, "formatted.cs")
           const bom = String.fromCharCode(0xfeff)
           yield* Effect.promise(() => fs.writeFile(filepath, `${bom}using System;\n`, "utf-8"))
+          const next = receiptContext(`${bom}using System;\n`)
 
-          yield* run({ filePath: filepath, content: "using Up;\n" })
+          yield* run({ filePath: filepath, content: "using Up;\n" }, next)
 
           const content = yield* Effect.promise(() => fs.readFile(filepath, "utf-8"))
           expect(content.charCodeAt(0)).toBe(0xfeff)
           expect(content.slice(1)).toBe("using Up;\n")
+          expect(next.state.digest).toBe(new Bun.CryptoHasher("sha256").update(content).digest("hex"))
         }),
       {
         config: {

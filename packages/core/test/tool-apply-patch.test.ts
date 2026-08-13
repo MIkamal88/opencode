@@ -11,6 +11,7 @@ import { LocationMutation } from "@opencode-ai/core/location-mutation"
 import { PermissionV2 } from "@opencode-ai/core/permission"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
+import { SessionReadReceipt } from "@opencode-ai/core/session/read-receipt"
 import { ToolRegistry } from "@opencode-ai/core/tool/registry"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { ApplyPatchTool } from "@opencode-ai/core/tool/apply-patch"
@@ -29,6 +30,25 @@ let blockRemoveTarget: string | undefined
 let removeStarted: Deferred.Deferred<void> | undefined
 let releaseRemove: Deferred.Deferred<void> | undefined
 let afterEditApproval = (): Effect.Effect<void> => Effect.void
+let receiptMatches = true
+const receiptChecks: Array<{ readonly canonicalPath: AbsolutePath; readonly digest: string }> = []
+const invalidatedReceipts: AbsolutePath[] = []
+
+const receipts = Layer.mock(SessionReadReceipt.Service, {
+  get: () => Effect.succeed(undefined),
+  match: (input) =>
+    Effect.sync(() => {
+      receiptChecks.push(input)
+      return receiptMatches
+    }),
+  upsert: () => Effect.die("unused"),
+  invalidate: (input) =>
+    Effect.sync(() => {
+      invalidatedReceipts.push(input.canonicalPath)
+      return true
+    }),
+  clear: () => Effect.succeed(0),
+})
 
 const permission = Layer.succeed(
   PermissionV2.Service,
@@ -61,6 +81,9 @@ const reset = () => {
   removeStarted = undefined
   releaseRemove = undefined
   afterEditApproval = () => Effect.void
+  receiptMatches = true
+  receiptChecks.length = 0
+  invalidatedReceipts.length = 0
 }
 
 const filesystem = Layer.effect(
@@ -108,6 +131,7 @@ const withTool = <A, E, R>(directory: string, body: (registry: ToolRegistry.Inte
           [Location.node, activeLocation],
           [PermissionV2.node, permission],
           [ToolOutputStore.node, ToolOutputStore.nodeWithoutConfig],
+          [SessionReadReceipt.node, receipts],
         ],
       ),
     ),
@@ -193,6 +217,122 @@ describe("ApplyPatchTool", () => {
                 )
                 expect(yield* Effect.promise(() => fs.readFile(update, "utf8"))).toBe("after\n")
                 expect(yield* exists(remove)).toBe(false)
+                expect(receiptChecks).toHaveLength(2)
+                expect(invalidatedReceipts).toEqual([
+                  AbsolutePath.make(path.join(tmp.path, "nested/new.txt")),
+                  AbsolutePath.make(update),
+                  AbsolutePath.make(remove),
+                ])
+              }),
+            ),
+          ),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("rejects an existing target without a read receipt and leaves it unchanged", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        receiptMatches = false
+        const target = path.join(tmp.path, "missing-receipt.txt")
+        return Effect.promise(() => fs.writeFile(target, "before\n")).pipe(
+          Effect.andThen(
+            withTool(tmp.path, (registry) =>
+              Effect.gen(function* () {
+                expect(
+                  yield* executeTool(
+                    registry,
+                    call("*** Begin Patch\n*** Update File: missing-receipt.txt\n@@\n-before\n+after\n*** End Patch"),
+                  ),
+                ).toEqual({
+                  type: "error",
+                  value: expect.stringContaining(
+                    "Read this file with the read tool immediately before applying the patch",
+                  ),
+                })
+                expect(yield* Effect.promise(() => fs.readFile(target, "utf8"))).toBe("before\n")
+                expect(invalidatedReceipts).toEqual([])
+              }),
+            ),
+          ),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("rejects a stale read receipt after the file changes", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        receiptMatches = false
+        const target = path.join(tmp.path, "stale.txt")
+        return Effect.promise(() => fs.writeFile(target, "changed\n")).pipe(
+          Effect.andThen(
+            withTool(tmp.path, (registry) =>
+              Effect.gen(function* () {
+                expect(
+                  yield* executeTool(registry, call("*** Begin Patch\n*** Delete File: stale.txt\n*** End Patch")),
+                ).toMatchObject({
+                  type: "error",
+                  value: expect.stringContaining("then retry with its current contents"),
+                })
+                expect(yield* exists(target)).toBe(true)
+                expect(receiptChecks).toHaveLength(1)
+              }),
+            ),
+          ),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("adds a new file without checking or minting a receipt and invalidates stale state", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        receiptMatches = false
+        return withTool(tmp.path, (registry) =>
+          Effect.gen(function* () {
+            expect(
+              yield* executeTool(registry, call("*** Begin Patch\n*** Add File: added.txt\n+added\n*** End Patch")),
+            ).toMatchObject({ type: "text" })
+            expect(receiptChecks).toEqual([])
+            expect(invalidatedReceipts).toEqual([AbsolutePath.make(path.join(tmp.path, "added.txt"))])
+          }),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("rejects duplicate canonical targets before reading file contents", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        const target = path.join(tmp.path, "duplicate.txt")
+        return Effect.promise(() => fs.writeFile(target, "before\n")).pipe(
+          Effect.andThen(
+            withTool(tmp.path, (registry) =>
+              Effect.gen(function* () {
+                expect(
+                  yield* executeTool(
+                    registry,
+                    call(
+                      "*** Begin Patch\n*** Update File: duplicate.txt\n@@\n-before\n+first\n*** Delete File: ./duplicate.txt\n*** End Patch",
+                    ),
+                  ),
+                ).toMatchObject({ type: "error", value: expect.stringContaining("canonical file only once") })
+                expect(receiptChecks).toEqual([])
+                expect(yield* Effect.promise(() => fs.readFile(target, "utf8"))).toBe("before\n")
               }),
             ),
           ),
@@ -426,6 +566,51 @@ describe("ApplyPatchTool", () => {
               yield* Fiber.join(interrupt)
               expect(yield* exists(first)).toBe(false)
               expect(yield* exists(second)).toBe(false)
+            }),
+          )
+        })
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("holds a delete lock against a concurrent FileMutation write", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        const targetPath = path.join(tmp.path, "shared.txt")
+        return Effect.gen(function* () {
+          const deleteStarted = yield* Deferred.make<void>()
+          const releaseDelete = yield* Deferred.make<void>()
+          yield* Effect.promise(() => fs.writeFile(targetPath, "before\n"))
+          yield* withTool(tmp.path, (registry) =>
+            Effect.gen(function* () {
+              const mutation = yield* LocationMutation.Service
+              const files = yield* FileMutation.Service
+              const target = yield* mutation.resolve({ path: "shared.txt" })
+              yield* toolDefinitions(registry)
+              const remove = yield* files
+                .withBatch([target], (batch) =>
+                  Deferred.succeed(deleteStarted, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseDelete)),
+                    Effect.andThen(batch.operations.remove({ target: batch.targets[0] })),
+                  ),
+                )
+                .pipe(Effect.forkChild)
+              yield* Deferred.await(deleteStarted)
+              const writeStarted = yield* Deferred.make<void>()
+              const write = yield* files.write({ target, content: "winner\n" }).pipe(
+                Effect.tap(() => Deferred.succeed(writeStarted, undefined)),
+                Effect.forkChild,
+              )
+              yield* Effect.yieldNow
+              expect(yield* Deferred.isDone(writeStarted)).toBe(false)
+
+              yield* Deferred.succeed(releaseDelete, undefined)
+              expect(yield* Fiber.join(remove)).toMatchObject({ operation: "remove", existed: true })
+              yield* Fiber.join(write)
+              expect(yield* Effect.promise(() => fs.readFile(targetPath, "utf8"))).toBe("winner\n")
             }),
           )
         })

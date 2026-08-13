@@ -145,6 +145,7 @@ async function buildTool() {
     }),
     Layer.mock(Truncate.Service, {
       output: (text: string) => Effect.succeed({ content: text, truncated: false as const }),
+      ownership: () => ({ retain: () => Effect.void, discard: () => Effect.void }),
     }),
     Layer.mock(Agent.Service, { get: () => Effect.succeed({ name: "build", permission: [] } as any) }),
     Layer.mock(Session.Service, { get: () => Effect.succeed({ permission: [] } as any) }),

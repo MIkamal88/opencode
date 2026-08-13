@@ -4,6 +4,7 @@ import { ToolFailure } from "@opencode-ai/llm"
 import { Effect, Layer, Schema } from "effect"
 import { makeLocationNode } from "../effect/app-node"
 import { FileSystem } from "../filesystem"
+import { FileMutation } from "../file-mutation"
 import { Image } from "../image"
 import { LocationMutation } from "../location-mutation"
 import { PermissionV2 } from "../permission"
@@ -12,6 +13,7 @@ import { ReadToolFileSystem } from "./read-filesystem"
 import { ToolRegistry } from "./registry"
 import { Tool } from "./tool"
 import { Tools } from "./tools"
+import { make as trustedReceipt } from "./trusted-receipt"
 
 export const name = "read"
 const SUPPORTED_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"])
@@ -34,6 +36,7 @@ const layer = Layer.effectDiscard(
     const mutation = yield* LocationMutation.Service
     const image = yield* Image.Service
     const permission = yield* PermissionV2.Service
+    const files = yield* FileMutation.Service
 
     yield* tools
       .register({
@@ -67,8 +70,6 @@ const layer = Layer.effectDiscard(
                   source,
                 })
               const resource = target.resource
-              const absolute = AbsolutePath.make(target.canonical)
-              const type = yield* reader.inspect(absolute)
               yield* permission.assert({
                 action: name,
                 resources: [resource],
@@ -77,20 +78,33 @@ const layer = Layer.effectDiscard(
                 agent: context.agent,
                 source,
               })
-              if (type === "directory")
-                return yield* reader.list(absolute, { offset: input.offset, limit: input.limit })
-              const content = yield* reader.read(absolute, resource, {
-                offset: input.offset,
-                limit: input.limit,
+              return yield* files.withBatch([target], (batch) => {
+                const absolute = AbsolutePath.make(batch.targets[0].canonical)
+                return Effect.gen(function* () {
+                  const type = yield* reader.inspect(absolute)
+                  if (type === "directory")
+                    return yield* reader.list(absolute, { offset: input.offset, limit: input.limit })
+                  const pending = yield* reader.readReceipt(absolute, resource, {
+                    offset: input.offset,
+                    limit: input.limit,
+                  })
+                  const receipt = { canonicalPath: absolute, digest: pending.digest }
+                  const content = pending.value
+                  if (
+                    "encoding" in content &&
+                    content.encoding === "base64" &&
+                    SUPPORTED_IMAGE_MIMES.has(content.mime)
+                  ) {
+                    const normalized = yield* image
+                      .normalize(resource, { ...content, encoding: "base64" })
+                      .pipe(Effect.catchTag("Image.ResizerUnavailableError", () => Effect.succeed(content)))
+                    return trustedReceipt(normalized, receipt)
+                  }
+                  if ("encoding" in content && content.encoding === "base64")
+                    return yield* Effect.fail(new ReadToolFileSystem.BinaryFileError({ resource }))
+                  return trustedReceipt(content, receipt)
+                })
               })
-              if ("encoding" in content && content.encoding === "base64" && SUPPORTED_IMAGE_MIMES.has(content.mime)) {
-                return yield* image
-                  .normalize(resource, { ...content, encoding: "base64" })
-                  .pipe(Effect.catchTag("Image.ResizerUnavailableError", () => Effect.succeed(content)))
-              }
-              if ("encoding" in content && content.encoding === "base64")
-                return yield* Effect.fail(new ReadToolFileSystem.BinaryFileError({ resource }))
-              return content
             }).pipe(
               Effect.mapError((error) => {
                 const message =
@@ -113,5 +127,12 @@ const layer = Layer.effectDiscard(
 export const node = makeLocationNode({
   name: "tool/read",
   layer,
-  deps: [ToolRegistry.node, ReadToolFileSystem.node, LocationMutation.node, Image.node, PermissionV2.node],
+  deps: [
+    ToolRegistry.node,
+    ReadToolFileSystem.node,
+    LocationMutation.node,
+    FileMutation.node,
+    Image.node,
+    PermissionV2.node,
+  ],
 })

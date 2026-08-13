@@ -12,6 +12,7 @@ import { LocationMutation } from "@opencode-ai/core/location-mutation"
 import { PermissionV2 } from "@opencode-ai/core/permission"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
+import { SessionReadReceipt } from "@opencode-ai/core/session/read-receipt"
 import { ToolRegistry } from "@opencode-ai/core/tool/registry"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { EditTool } from "@opencode-ai/core/tool/edit"
@@ -26,6 +27,14 @@ const writes: string[] = []
 let reads = 0
 let denyAction: string | undefined
 let afterRead = (_target: string, _content: Uint8Array): Effect.Effect<void> => Effect.void
+let receiptMatches = true
+const receipts = Layer.mock(SessionReadReceipt.Service, {
+  get: () => Effect.succeed(undefined),
+  match: () => Effect.succeed(receiptMatches),
+  upsert: () => Effect.die("unused"),
+  invalidate: () => Effect.succeed(true),
+  clear: () => Effect.succeed(0),
+})
 
 const permission = Layer.succeed(
   PermissionV2.Service,
@@ -50,6 +59,7 @@ const reset = () => {
   reads = 0
   denyAction = undefined
   afterRead = () => Effect.void
+  receiptMatches = true
 }
 
 const filesystem = Layer.effect(
@@ -98,6 +108,7 @@ const withTool = <A, E, R>(directory: string, body: (registry: ToolRegistry.Inte
           [Location.node, activeLocation],
           [PermissionV2.node, permission],
           [ToolOutputStore.node, ToolOutputStore.nodeWithoutConfig],
+          [SessionReadReceipt.node, receipts],
         ],
       ),
     ),
@@ -150,6 +161,7 @@ describe("EditTool", () => {
                 expect(yield* Effect.promise(() => fs.readFile(target, "utf8"))).toBe("after\nrest\n")
                 expect(assertions).toMatchObject([{ sessionID, action: "edit", resources: ["hello.txt"], save: ["*"] }])
                 expect(writes).toEqual([yield* Effect.promise(() => fs.realpath(target))])
+                yield* Effect.forEach(settled.releases ?? [], (release) => release(), { discard: true })
               }),
             ),
           ),
@@ -336,6 +348,88 @@ describe("EditTool", () => {
     ),
   )
 
+  it.live("applies a batch against one snapshot and rejects ambiguous or overlapping entries atomically", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        const target = path.join(tmp.path, "batch.txt")
+        return Effect.promise(() => fs.writeFile(target, "alpha beta gamma\n")).pipe(
+          Effect.andThen(
+            withTool(tmp.path, (registry) =>
+              Effect.gen(function* () {
+                const settled = yield* settleTool(
+                  registry,
+                  call({
+                    path: "batch.txt",
+                    edits: [
+                      { oldString: "alpha", newString: "one" },
+                      { oldString: "gamma", newString: "three" },
+                    ],
+                  }),
+                )
+                expect(settled.output?.structured).toMatchObject({ replacements: 2 })
+                expect(yield* Effect.promise(() => fs.readFile(target, "utf8"))).toBe("one beta three\n")
+                expect(writes).toHaveLength(1)
+                yield* Effect.forEach(settled.releases ?? [], (release) => release(), { discard: true })
+
+                yield* Effect.promise(() => fs.writeFile(target, "abcdef"))
+                writes.length = 0
+                expect(
+                  yield* executeTool(
+                    registry,
+                    call({
+                      path: "batch.txt",
+                      edits: [
+                        { oldString: "abc", newString: "x" },
+                        { oldString: "bc", newString: "y" },
+                      ],
+                    }),
+                  ),
+                ).toEqual({
+                  type: "error",
+                  value: "Batch edits overlap in the original file: edits[0] and edits[1].",
+                })
+                expect(yield* Effect.promise(() => fs.readFile(target, "utf8"))).toBe("abcdef")
+                expect(writes).toEqual([])
+              }),
+            ),
+          ),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("requires a matching session receipt", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        receiptMatches = false
+        const target = path.join(tmp.path, "unread.txt")
+        return Effect.promise(() => fs.writeFile(target, "before")).pipe(
+          Effect.andThen(
+            withTool(tmp.path, (registry) =>
+              executeTool(registry, call({ path: "unread.txt", oldString: "before", newString: "after" })),
+            ),
+          ),
+          Effect.tap((result) =>
+            Effect.sync(() =>
+              expect(result).toEqual({
+                type: "error",
+                value: "File changed after permission approval. Read it again before editing.",
+              }),
+            ),
+          ),
+          Effect.andThen(Effect.promise(() => fs.readFile(target, "utf8"))),
+          Effect.tap((content) => Effect.sync(() => expect(content).toBe("before"))),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
   it.live("replaces every exact occurrence when replaceAll is true", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => tmpdir()),
@@ -418,7 +512,7 @@ test("keeps the locked edit schema, semantics docstring, and deferred TODOs visi
   )
   const schema = definition[0]?.inputSchema as { readonly properties?: Record<string, unknown> }
 
-  expect(Object.keys(schema.properties ?? {}).sort()).toEqual(["newString", "oldString", "path", "replaceAll"])
+  expect(schema).toHaveProperty("anyOf")
   expect(source).toContain(
     "absolute external paths retain mutation capability through a separate\n * external_directory approval before edit approval.",
   )

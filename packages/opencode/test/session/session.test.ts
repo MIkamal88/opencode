@@ -16,6 +16,9 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { InstanceStore } from "@/project/instance-store"
 import { InstanceBootstrap } from "@/project/bootstrap"
+import { SessionReadReceipt } from "@opencode-ai/core/session/read-receipt"
+import { AbsolutePath } from "@opencode-ai/core/schema"
+import { SessionSchema } from "@opencode-ai/core/session/schema"
 
 const it = testEffect(
   AppNodeBuilder.build(
@@ -25,6 +28,7 @@ const it = testEffect(
       SessionProjector.node,
       CrossSpawnSpawner.node,
       InstanceStore.node,
+      SessionReadReceipt.node,
     ]),
     [
       [RuntimeFlags.node, RuntimeFlags.layer({ experimentalWorkspaces: false })],
@@ -202,6 +206,58 @@ describe("step-finish token propagation via event", () => {
         yield* session.remove(info.id)
       }),
     { timeout: 30000 },
+  )
+})
+
+describe("session part commit callback", () => {
+  it.instance("atomically records a private read receipt with PartUpdated", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const receipts = yield* SessionReadReceipt.Service
+      const info = yield* session.create({})
+      const messageID = MessageID.ascending()
+      const canonicalPath = AbsolutePath.make(info.directory + "/receipt.txt")
+      const digest = "a".repeat(64)
+      const partID = PartID.ascending()
+
+      yield* session.updateMessage({
+        id: messageID,
+        sessionID: info.id,
+        role: "user",
+        time: { created: Date.now() },
+        agent: "user",
+        model: { providerID: "test", modelID: "test" },
+        tools: {},
+        mode: "",
+      } as unknown as SessionV1.Info)
+
+      yield* session.updatePart(
+        {
+          id: partID,
+          messageID,
+          sessionID: info.id,
+          type: "text",
+          text: "visible output only",
+        },
+        (seq, client) =>
+          SessionReadReceipt.upsertIn(client, {
+            sessionID: SessionSchema.ID.make(info.id),
+            canonicalPath,
+            digest,
+            settledSeq: seq,
+            callID: "call_private",
+          }).pipe(Effect.orDie, Effect.asVoid),
+      )
+
+      expect(yield* receipts.get({ sessionID: SessionSchema.ID.make(info.id), canonicalPath })).toMatchObject({
+        digest,
+        settledSeq: 2,
+        callID: "call_private",
+      })
+      const part = yield* session.getPart({ sessionID: info.id, messageID, partID })
+      expect(JSON.stringify(part)).not.toContain(digest)
+      expect(JSON.stringify(part)).not.toContain("canonicalPath")
+    }),
   )
 })
 

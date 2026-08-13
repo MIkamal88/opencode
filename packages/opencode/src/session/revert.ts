@@ -9,6 +9,8 @@ import { MessageV2 } from "./message-v2"
 import { SessionID, MessageID, PartID } from "./schema"
 import { SessionRunState } from "./run-state"
 import { SessionSummary } from "./summary"
+import { SessionReadReceipt } from "@opencode-ai/core/session/read-receipt"
+import { SessionSchema } from "@opencode-ai/core/session/schema"
 
 export const RevertInput = Schema.Struct({
   sessionID: SessionID,
@@ -34,6 +36,7 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const summary = yield* SessionSummary.Service
     const state = yield* SessionRunState.Service
+    const receipts = yield* SessionReadReceipt.Service
 
     const revert = Effect.fn("SessionRevert.revert")(function* (input: RevertInput) {
       yield* state.assertNotBusy(input.sessionID)
@@ -67,6 +70,7 @@ const layer = Layer.effect(
 
       if (!rev) return session
 
+      yield* receipts.clear(SessionSchema.ID.make(input.sessionID)).pipe(Effect.orDie)
       rev.snapshot = session.revert?.snapshot ?? (yield* snap.track())
       if (session.revert?.snapshot) yield* snap.restore(session.revert.snapshot)
       yield* snap.revert(patches)
@@ -84,6 +88,8 @@ const layer = Layer.effect(
           deletions: diffs.reduce((sum, x) => sum + x.deletions, 0),
           files: diffs.length,
         },
+        commit: (_seq, client) =>
+          SessionReadReceipt.clearIn(client, SessionSchema.ID.make(input.sessionID)).pipe(Effect.asVoid),
       })
       return yield* sessions.get(input.sessionID).pipe(Effect.orDie)
     })
@@ -93,6 +99,7 @@ const layer = Layer.effect(
       yield* state.assertNotBusy(input.sessionID)
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       if (!session.revert) return session
+      yield* receipts.clear(SessionSchema.ID.make(input.sessionID)).pipe(Effect.orDie)
       if (session.revert.snapshot) yield* snap.restore(session.revert.snapshot)
       yield* sessions.clearRevert(input.sessionID)
       return yield* sessions.get(input.sessionID).pipe(Effect.orDie)
@@ -130,7 +137,15 @@ const layer = Layer.effect(
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [Session.node, Snapshot.node, Storage.node, EventV2Bridge.node, SessionSummary.node, SessionRunState.node],
+  deps: [
+    Session.node,
+    Snapshot.node,
+    Storage.node,
+    EventV2Bridge.node,
+    SessionSummary.node,
+    SessionRunState.node,
+    SessionReadReceipt.node,
+  ],
 })
 
 export * as SessionRevert from "./revert"

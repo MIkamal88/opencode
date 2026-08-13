@@ -3,16 +3,38 @@ import fs from "fs/promises"
 import { realpathSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { Effect, Exit, Fiber, Stream } from "effect"
+import { Cause, Effect, Exit, Fiber, Option, Stream } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppProcess } from "@opencode-ai/core/process"
+import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
+import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
+import { Global } from "@opencode-ai/core/global"
+import { tmpdir as managedTmpdir } from "../fixture/tmpdir"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(LayerNode.compile(AppProcess.node))
 
 const NODE = process.execPath
 const cmd = (...args: string[]) => ChildProcess.make(NODE, args)
+
+const capture = <A, E, R>(
+  body: (process: AppProcess.Interface, store: ToolOutputStore.Interface) => Effect.Effect<A, E, R>,
+) =>
+  Effect.acquireUseRelease(
+    Effect.promise(() => managedTmpdir()),
+    (tmp) =>
+      Effect.gen(function* () {
+        return yield* body(yield* AppProcess.Service, yield* ToolOutputStore.Service)
+      }).pipe(
+        Effect.provide(
+          AppNodeBuilder.build(LayerNode.group([AppProcess.node, ToolOutputStore.nodeWithoutConfig]), [
+            [Global.node, Global.layerWith({ data: tmp.path })],
+          ]),
+        ),
+      ),
+    (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+  )
 
 const waitForFile = (file: string) =>
   Effect.promise(async () => {
@@ -27,6 +49,250 @@ const waitForFile = (file: string) =>
   })
 
 describe("AppProcess", () => {
+  describe("runCapture", () => {
+    it.live("preserves observed stdout and stderr order and nonzero exits", () =>
+      capture((process, store) =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const sink = yield* store.capture()
+            const script = `process.stdout.write('out-1\\n');setTimeout(()=>process.stderr.write('err-1\\n'),20);setTimeout(()=>{process.stdout.write('out-2\\n');process.exit(7)},40)`
+            const result = yield* process.runCapture(cmd("-e", script), sink)
+            expect(result.exitCode).toBe(7)
+            expect(result.timeout).toBe(false)
+            expect(result.capture.tail).toBe("out-1\nerr-1\nout-2\n")
+          }),
+        ),
+      ),
+    )
+
+    if (process.platform !== "win32") {
+      it.live(
+        "retains timeout output emitted before process-group termination",
+        () =>
+          capture((process, store) =>
+            Effect.scoped(
+              Effect.gen(function* () {
+                const sink = yield* store.capture()
+                const script = `process.stdout.write('before-timeout\\n');process.on('SIGTERM',()=>{process.stderr.write('during-termination\\n');process.exit(0)});setInterval(()=>{},60000)`
+                const result = yield* process.runCapture(cmd("-e", script), sink, { timeout: "250 millis" })
+                expect(result.timeout).toBe(true)
+                expect(result.capture.tail).toContain("before-timeout")
+                expect(result.capture.tail).toContain("during-termination")
+              }),
+            ),
+          ),
+        5_000,
+      )
+
+      it.live(
+        "waits through a quiet inherited pipe and captures active post-exit output",
+        () =>
+          capture((process, store) =>
+            Effect.scoped(
+              Effect.gen(function* () {
+                const sink = yield* store.capture()
+                const script = `const {spawn}=require('child_process');const child=spawn(process.execPath,['-e',${JSON.stringify("setTimeout(()=>process.stdout.write('late\\n'),300);setTimeout(()=>process.exit(0),400)")}],{stdio:['ignore',process.stdout,process.stderr]});child.unref();process.stdout.write('early\\n')`
+                const result = yield* process.runCapture(cmd("-e", script), sink)
+                expect(result.exitCode).toBe(0)
+                expect(result.capture.tail).toBe("early\nlate\n")
+              }),
+            ),
+          ),
+        5_000,
+      )
+
+      it.live(
+        "preserves root exit while cleaning up a descendant that continuously writes",
+        () =>
+          capture((process, store) =>
+            Effect.scoped(
+              Effect.gen(function* () {
+                const sink = yield* store.capture()
+                const child = `setInterval(()=>process.stdout.write('tick\\n'),10)`
+                const script = `const {spawn}=require('child_process');const child=spawn(process.execPath,['-e',${JSON.stringify(child)}],{stdio:['ignore',process.stdout,process.stderr]});child.unref()`
+                const started = Date.now()
+                const result = yield* process.runCapture(cmd("-e", script), sink, { timeout: "5 seconds" })
+                expect(result.timeout).toBe(false)
+                expect(result.exitCode).toBe(0)
+                expect(Date.now() - started).toBeLessThan(4_000)
+                expect(result.capture.tail).toContain("tick")
+              }),
+            ),
+          ),
+        5_000,
+      )
+
+      it.live("maps signal-only root exits to conventional status codes", () =>
+        capture((process, store) =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const sink = yield* store.capture()
+              const result = yield* process.runCapture(cmd("-e", "process.kill(process.pid, 'SIGTERM')"), sink)
+              expect(result.exitCode).toBe(143)
+            }),
+          ),
+        ),
+      )
+
+      it.live(
+        "escalates process-group cleanup when SIGTERM is ignored",
+        Effect.acquireUseRelease(
+          Effect.promise(() => managedTmpdir()),
+          (tmp) => {
+            const pidFile = path.join(tmp.path, "stubborn-pid")
+            return capture((process, store) =>
+              Effect.scoped(
+                Effect.gen(function* () {
+                  const sink = yield* store.capture()
+                  const child = `process.on('SIGTERM',()=>{});setInterval(()=>process.stdout.write('tick\\n'),10)`
+                  const script = `const fs=require('fs');const {spawn}=require('child_process');const child=spawn(process.execPath,['-e',${JSON.stringify(child)}],{stdio:['ignore',process.stdout,process.stderr]});fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid));child.unref()`
+                  const result = yield* process.runCapture(cmd("-e", script), sink, { timeout: "250 millis" })
+                  expect(result.timeout).toBe(true)
+                  const pid = Number(yield* waitForFile(pidFile))
+                  const info = yield* Effect.promise(() =>
+                    Bun.$`ps -o stat= -p ${pid}`
+                      .quiet()
+                      .text()
+                      .catch(() => ""),
+                  )
+                  expect(info.trim() === "" || info.trim().startsWith("Z")).toBe(true)
+                }),
+              ),
+            )
+          },
+          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+        ),
+        8_000,
+      )
+
+      it.live(
+        "terminates descendants that keep inherited pipes open after the idle cutoff",
+        Effect.acquireUseRelease(
+          Effect.promise(() => managedTmpdir()),
+          (tmp) => {
+            const pidFile = path.join(tmp.path, "descendant-pid")
+            return capture((process, store) =>
+              Effect.scoped(
+                Effect.gen(function* () {
+                  const sink = yield* store.capture()
+                  const child = `setInterval(()=>{},60000)`
+                  const script = `const fs=require('fs');const {spawn}=require('child_process');const child=spawn(process.execPath,['-e',${JSON.stringify(child)}],{stdio:['ignore',process.stdout,process.stderr]});fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid));child.unref();process.stdout.write('early\\n')`
+                  const result = yield* process.runCapture(cmd("-e", script), sink)
+                  expect(result.capture.tail).toBe("early\n")
+                  const pid = Number(yield* waitForFile(pidFile))
+                  const info = yield* Effect.promise(() =>
+                    Bun.$`ps -o stat= -p ${pid}`
+                      .quiet()
+                      .text()
+                      .catch(() => ""),
+                  )
+                  expect(info.trim() === "" || info.trim().startsWith("Z")).toBe(true)
+                }),
+              ),
+            )
+          },
+          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+        ),
+        10_000,
+      )
+    }
+
+    it.live("preserves Effect interruption", () =>
+      capture((process, store) =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const sink = yield* store.capture()
+            const fiber = yield* process.runCapture(cmd("-e", "setInterval(()=>{},60000)"), sink).pipe(Effect.forkChild)
+            yield* Effect.sleep("100 millis")
+            yield* Fiber.interrupt(fiber)
+            const exit = yield* Fiber.await(fiber)
+            expect(Exit.isFailure(exit) && exit.cause.reasons.some((reason) => reason._tag === "Interrupt")).toBe(true)
+          }),
+        ),
+      ),
+    )
+
+    it.live("preserves AbortSignal cancellation", () =>
+      capture((process, store) =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const sink = yield* store.capture()
+            const controller = new AbortController()
+            controller.abort(new Error("cancel capture"))
+            const exit = yield* process
+              .runCapture(cmd("-e", "setInterval(()=>{},60000)"), sink, { signal: controller.signal })
+              .pipe(Effect.exit)
+            expect(Exit.isFailure(exit)).toBe(true)
+            if (Exit.isFailure(exit))
+              expect(Option.getOrUndefined(Cause.findErrorOption(exit.cause))).toMatchObject({
+                _tag: "AppProcessError",
+                message: expect.stringContaining("cancel capture"),
+              })
+          }),
+        ),
+      ),
+    )
+
+    it.effect(
+      "propagates capture write and finish failures without wrapping them",
+      Effect.gen(function* () {
+        const process = yield* AppProcess.Service
+        const writeFailure = new ToolOutputStore.StorageError({ operation: "write", cause: new Error("sink write") })
+        const writeExit = yield* process
+          .runCapture(cmd("-e", "process.stdout.write('output')"), {
+            write: () => Effect.fail(writeFailure),
+            finish: () => Effect.die("unused"),
+            discard: () => Effect.void,
+          })
+          .pipe(Effect.exit)
+        expect(Exit.isFailure(writeExit)).toBe(true)
+        if (Exit.isFailure(writeExit))
+          expect(Option.getOrUndefined(Cause.findErrorOption(writeExit.cause))).toBe(writeFailure)
+
+        for (const operation of ["flush", "close"] as const) {
+          const failure = new ToolOutputStore.StorageError({ operation, cause: new Error(`sink ${operation}`) })
+          const exit = yield* process
+            .runCapture(cmd("-e", "process.exit(0)"), {
+              write: () => Effect.void,
+              finish: () => Effect.fail(failure),
+              discard: () => Effect.void,
+            })
+            .pipe(Effect.exit)
+          expect(Exit.isFailure(exit)).toBe(true)
+          if (Exit.isFailure(exit)) expect(Option.getOrUndefined(Cause.findErrorOption(exit.cause))).toBe(failure)
+        }
+      }),
+    )
+
+    if (process.platform !== "win32") {
+      it.live(
+        "terminates the process promptly when capture storage fails",
+        Effect.acquireUseRelease(
+          Effect.promise(() => managedTmpdir()),
+          (tmp) => {
+            const settled = path.join(tmp.path, "storage-failure-settled")
+            return Effect.gen(function* () {
+              const process = yield* AppProcess.Service
+              const failure = new ToolOutputStore.StorageError({ operation: "write", cause: new Error("disk full") })
+              const script = `const fs=require('fs');process.stdout.write('output');process.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(settled)},'settled');process.exit(0)});setInterval(()=>{},60000)`
+              const exit = yield* process
+                .runCapture(cmd("-e", script), {
+                  write: () => Effect.fail(failure),
+                  finish: () => Effect.die("unused"),
+                  discard: () => Effect.void,
+                })
+                .pipe(Effect.exit)
+              expect(Exit.isFailure(exit)).toBe(true)
+              expect(yield* waitForFile(settled)).toBe("settled")
+            })
+          },
+          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+        ),
+        5_000,
+      )
+    }
+  })
+
   describe("run", () => {
     it.effect(
       "captures stdout and exit code zero",

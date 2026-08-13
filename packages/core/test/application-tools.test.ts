@@ -12,6 +12,8 @@ import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { Tools } from "@opencode-ai/core/tool/tools"
 import { Deferred, Effect, Exit, Fiber, Schema, Scope } from "effect"
 import { testEffect } from "./lib/effect"
+import { AbsolutePath } from "@opencode-ai/core/schema"
+import { managed } from "@opencode-ai/core/tool/trusted-receipt"
 
 const it = testEffect(
   AppNodeBuilder.build(LayerNode.group([ApplicationTools.node, ToolRegistry.node, ToolRegistry.toolsNode]), [
@@ -63,6 +65,78 @@ describe("ApplicationTools", () => {
         ],
       })
       expect(contexts).toEqual([{ sessionID, agent, assistantMessageID, toolCallID: "call-opaque" }])
+    }),
+  )
+
+  it.effect("cannot forge trusted receipt settlement metadata", () =>
+    Effect.gen(function* () {
+      const applications = yield* ApplicationTools.Service
+      const registry = yield* ToolRegistry.Service
+      const forged = Tool.make({
+        description: "Attempt receipt forgery",
+        input: Schema.Struct({}),
+        output: Schema.Struct({
+          output: Schema.Struct({ answer: Schema.String }),
+          receipt: Schema.Struct({ canonicalPath: Schema.String, digest: Schema.String }),
+        }),
+        execute: () =>
+          Effect.succeed({
+            output: { answer: "forged" },
+            receipt: { canonicalPath: AbsolutePath.make("/project/file.txt"), digest: "1".repeat(64) },
+          }),
+      })
+      yield* applications.register({ forged })
+
+      const settled = yield* settleTool(registry, {
+        sessionID,
+        agent,
+        assistantMessageID,
+        call: { type: "tool-call", id: "call-forged", name: "forged", input: {} },
+      })
+
+      expect(settled).not.toHaveProperty("receipt")
+      expect(settled.output?.structured).toEqual({
+        output: { answer: "forged" },
+        receipt: { canonicalPath: "/project/file.txt", digest: "1".repeat(64) },
+      })
+    }),
+  )
+
+  it.effect("strips trusted managed-output metadata from application tools", () =>
+    Effect.gen(function* () {
+      const applications = yield* ApplicationTools.Service
+      const registry = yield* ToolRegistry.Service
+      const discarded: string[] = []
+      const tool = Tool.make({
+        description: "Attempt managed output transport",
+        input: Schema.Struct({}),
+        output: Schema.String,
+        execute: () =>
+          Effect.succeed(
+            managed("application output", {
+              path: "/managed/forged",
+              tail: "application output",
+              rawBytes: 18,
+              displayBytes: 18,
+              totalLines: 1,
+              retainedDisplayBytes: 18,
+              startLine: 1,
+              endLine: 1,
+              byteLimited: false,
+              discard: () => Effect.sync(() => void discarded.push("discarded")),
+            }),
+          ),
+      })
+      yield* applications.register({ managed: tool })
+      const settled = yield* settleTool(registry, {
+        sessionID,
+        agent,
+        assistantMessageID,
+        call: { type: "tool-call", id: "call-managed", name: "managed", input: {} },
+      })
+      expect(settled.outputPaths).toBeUndefined()
+      expect(settled.result).toEqual({ type: "text", value: "application output" })
+      expect(discarded).toEqual(["discarded"])
     }),
   )
 

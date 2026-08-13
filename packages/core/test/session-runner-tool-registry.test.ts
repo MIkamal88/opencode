@@ -11,12 +11,21 @@ import { ToolRegistry } from "@opencode-ai/core/tool/registry"
 import { executeTool, settleTool, toolDefinitions } from "./lib/tool"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, SchemaGetter, SchemaIssue, Scope } from "effect"
 import { testEffect } from "./lib/effect"
+import { AbsolutePath } from "@opencode-ai/core/schema"
+import { make as trustedReceipt, managed } from "@opencode-ai/core/tool/trusted-receipt"
 
 const bounds: ToolOutputStore.BoundInput[] = []
 const retentionFailure = new ToolOutputStore.StorageError({ operation: "write", cause: new Error("disk full") })
 const outputStore = Layer.mock(ToolOutputStore.Service, {
   bound: (input) => {
     if (input.toolCallID === "call-retention-failure") return Effect.fail(retentionFailure)
+    if (input.managedOutput?.path)
+      return Effect.succeed({
+        output: input.output,
+        outputPaths: [input.managedOutput.path],
+        ...(input.managedOutput.retain ? { retain: input.managedOutput.retain } : {}),
+        ...(input.managedOutput.discard ? { discard: input.managedOutput.discard } : {}),
+      })
     return Effect.sync(() => bounds.push(input)).pipe(
       Effect.as(
         input.toolCallID === "call-bounded"
@@ -216,6 +225,44 @@ describe("ToolRegistry", () => {
     }),
   )
 
+  it.effect("discards managed ownership when generic bounding fails", () =>
+    Effect.gen(function* () {
+      const discarded: string[] = []
+      const service = yield* ToolRegistry.Service
+      yield* service.register({
+        owned: Tool.make({
+          description: "Owned output",
+          input: Schema.Struct({}),
+          output: Schema.String,
+          execute: () =>
+            Effect.succeed(
+              managed("owned", {
+                path: "/managed/owned",
+                tail: "owned",
+                rawBytes: 100_000,
+                displayBytes: 100_000,
+                totalLines: 1,
+                retainedDisplayBytes: 5,
+                startLine: 1,
+                endLine: 1,
+                byteLimited: false,
+                discard: () => Effect.sync(() => void discarded.push("discarded")),
+              }),
+            ),
+        }),
+      })
+      const materialized = yield* service.materialize()
+      const exit = yield* materialized
+        .settle({
+          ...call("owned", "call-retention-failure"),
+          call: { type: "tool-call", id: "call-retention-failure", name: "owned", input: {} },
+        })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(discarded).toEqual(["discarded"])
+    }),
+  )
+
   it.effect("exposes settlement only through materialization", () =>
     Effect.gen(function* () {
       const service = yield* ToolRegistry.Service
@@ -264,6 +311,91 @@ describe("ToolRegistry", () => {
         outputPaths: ["/managed/generic"],
       })
       expect(bounds).toHaveLength(1)
+    }),
+  )
+
+  it.effect("transports managed output alongside a trusted receipt without duplicate bounding", () =>
+    Effect.gen(function* () {
+      bounds.length = 0
+      const retained: string[] = []
+      const discarded: string[] = []
+      const service = yield* ToolRegistry.Service
+      yield* service.register({
+        captured: Tool.make({
+          description: "Captured output",
+          input: Schema.Struct({}),
+          output: Schema.String,
+          execute: () =>
+            Effect.succeed(
+              managed(
+                "tail",
+                {
+                  path: "/managed/producer",
+                  tail: "tail",
+                  rawBytes: 100_000,
+                  displayBytes: 100_000,
+                  totalLines: 3_000,
+                  retainedDisplayBytes: 4,
+                  startLine: 3_000,
+                  endLine: 3_000,
+                  byteLimited: false,
+                  retain: () => Effect.sync(() => void retained.push("retained")),
+                  discard: () => Effect.sync(() => void discarded.push("discarded")),
+                },
+                {
+                  canonicalPath: AbsolutePath.make("/project/file.txt") as AbsolutePath,
+                  digest: "1".repeat(64),
+                },
+              ),
+            ),
+        }),
+      })
+      const settled = yield* settleTool(service, {
+        sessionID,
+        ...identity,
+        call: { type: "tool-call", id: "call-captured", name: "captured", input: {} },
+      })
+      expect(settled.outputPaths).toEqual(["/managed/producer"])
+      expect(settled.receipt).toMatchObject({ canonicalPath: "/project/file.txt", digest: "1".repeat(64) })
+      expect(settled.retains).toHaveLength(1)
+      expect(settled.discards).toHaveLength(1)
+      yield* Effect.forEach(settled.retains ?? [], (retain) => retain(), { discard: true })
+      expect(retained).toEqual(["retained"])
+      expect(discarded).toEqual([])
+      expect(bounds).toHaveLength(0)
+    }),
+  )
+
+  it.effect("keeps trusted settlement release private", () =>
+    Effect.gen(function* () {
+      let released = 0
+      const service = yield* ToolRegistry.Service
+      yield* service.register({
+        mutation: Tool.make({
+          description: "Mutation",
+          input: Schema.Struct({}),
+          output: Schema.String,
+          execute: () =>
+            Effect.succeed(
+              trustedReceipt(
+                "updated",
+                { canonicalPath: AbsolutePath.make("/project/file.txt"), digest: "2".repeat(64) },
+                () => Effect.sync(() => void released++),
+              ),
+            ),
+        }),
+      })
+      const settled = yield* settleTool(service, {
+        sessionID,
+        ...identity,
+        call: { type: "tool-call", id: "call-mutation", name: "mutation", input: {} },
+      })
+
+      expect(JSON.stringify(settled.result)).not.toContain("release")
+      expect(JSON.stringify(settled.output)).not.toContain("release")
+      expect(settled.releases).toHaveLength(1)
+      yield* settled.releases![0]()
+      expect(released).toBe(1)
     }),
   )
 
@@ -330,6 +462,45 @@ describe("ToolRegistry", () => {
           call: { type: "tool-call", id: "invalid-output", name: "invalid_output", input: {} },
         }),
       ).toMatchObject({ type: "error", value: expect.stringContaining("invalid value for its output schema") })
+    }),
+  )
+
+  it.effect("discards managed ownership when output schema validation fails", () =>
+    Effect.gen(function* () {
+      const discarded: string[] = []
+      const service = yield* ToolRegistry.Service
+      yield* service.register({
+        invalid_owned: Tool.make({
+          description: "Invalid owned output",
+          input: Schema.Struct({}),
+          output: Schema.Struct({ ok: Schema.Boolean }),
+          execute: () =>
+            Effect.succeed(
+              managed({ ok: "invalid" } as never, {
+                path: "/managed/invalid",
+                tail: "invalid",
+                rawBytes: 100_000,
+                displayBytes: 100_000,
+                totalLines: 1,
+                retainedDisplayBytes: 7,
+                startLine: 1,
+                endLine: 1,
+                byteLimited: false,
+                discard: () => Effect.sync(() => void discarded.push("discarded")),
+              }),
+            ),
+        }),
+      })
+      expect(
+        yield* executeTool(service, {
+          ...call("invalid_owned"),
+          call: { type: "tool-call", id: "invalid-owned", name: "invalid_owned", input: {} },
+        }),
+      ).toMatchObject({
+        type: "error",
+        value: expect.stringContaining("invalid value for its output schema"),
+      })
+      expect(discarded).toEqual(["discarded"])
     }),
   )
 

@@ -15,8 +15,16 @@ export function join(text: string, bom: boolean) {
   return BOM + stripped
 }
 
+export function decode(content: Uint8Array) {
+  try {
+    return split(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(content))
+  } catch {
+    throw new Error("File contains malformed UTF-8 and cannot be safely edited.")
+  }
+}
+
 export const readFile = Effect.fn("Bom.readFile")(function* (fs: FSUtil.Interface, filePath: string) {
-  return split(new TextDecoder("utf-8", { ignoreBOM: true }).decode(yield* fs.readFile(filePath)))
+  return decode(yield* fs.readFile(filePath))
 })
 
 export const syncFile = Effect.fn("Bom.syncFile")(function* (fs: FSUtil.Interface, filePath: string, bom: boolean) {

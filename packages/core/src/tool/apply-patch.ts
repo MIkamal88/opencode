@@ -43,8 +43,14 @@ export const toModelOutput = (output: Output) =>
   ].join("\n")
 
 type Prepared =
-  | (Extract<Patch.Hunk, { readonly type: "add" | "delete" }> & {
+  | (Extract<Patch.Hunk, { readonly type: "add" }> & {
       readonly target: LocationMutation.Target
+      readonly before: string
+      readonly after: string
+    })
+  | (Extract<Patch.Hunk, { readonly type: "delete" }> & {
+      readonly target: LocationMutation.Target
+      readonly source: Uint8Array
       readonly before: string
       readonly after: string
     })
@@ -69,18 +75,18 @@ const layer = Layer.effectDiscard(
         [name]: Tool.withPermission(
           Tool.make({
             description:
-              "Apply one patch containing add, update, and delete file operations. All targets are resolved and approved before target contents are read. Operations apply sequentially; if a later operation fails, earlier operations remain applied and the failure reports them explicitly. Moves and atomic rollback are not supported yet.",
+              "Apply one patch containing add, update, and delete file operations. Existing update and delete targets must be read first and must be read again after a successful patch before another mutation. All targets are resolved and approved before target contents are read. Operations apply sequentially; if a later operation fails, earlier operations remain applied and the failure reports them explicitly. Moves and atomic rollback are not supported yet.",
             input: Input,
             output: Output,
             toModelOutput: ({ output }) => [{ type: "text", text: toModelOutput(output) }],
             execute: (input, context) => {
               const applied: Array<typeof Applied.Type> = []
-              const fail = (path: string) => {
+              const fail = (path: string, guidance?: string) => {
                 const prefix =
                   applied.length === 0
                     ? `Unable to apply patch at ${path}`
                     : `Patch partially applied before failing at ${path}. Applied: ${applied.map((item) => item.resource).join(", ")}`
-                return new ToolFailure({ message: prefix })
+                return new ToolFailure({ message: guidance ? `${prefix}. ${guidance}` : prefix })
               }
               return Effect.gen(function* () {
                 const source = {
@@ -122,70 +128,105 @@ const layer = Layer.effectDiscard(
                   source,
                 })
 
-                const prepared: Prepared[] = []
-                for (const { hunk, target } of targets) {
-                  yield* Effect.gen(function* () {
-                    if (hunk.type === "add") {
-                      prepared.push({
-                        ...hunk,
-                        target,
-                        before: "",
-                        after:
-                          hunk.contents.endsWith("\n") || hunk.contents === "" ? hunk.contents : `${hunk.contents}\n`,
-                      })
-                      return
-                    }
-                    if ((yield* fs.stat(target.canonical)).type !== "File") yield* fail(hunk.path)
-                    const source = yield* fs.readFile(target.canonical)
-                    const original = new TextDecoder("utf-8", { ignoreBOM: true }).decode(source)
-                    const before = original.replace(/^\uFEFF/, "")
-                    if (hunk.type === "delete") {
-                      prepared.push({ ...hunk, target, before, after: "" })
-                      return
-                    }
-                    const update = Patch.derive(hunk.path, hunk.chunks, original)
-                    prepared.push({
-                      ...hunk,
-                      target,
-                      source,
-                      content: Patch.joinBom(update.content, update.bom),
-                      before,
-                      after: update.content,
-                    })
-                  }).pipe(Effect.mapError(() => fail(hunk.path)))
-                }
-
-                const patchFiles = prepared.map(patchFile)
-                yield* Effect.forEach(
-                  prepared,
-                  (change) =>
+                return yield* files.withBatch(
+                  targets.map((item) => item.target),
+                  (batch) =>
                     Effect.gen(function* () {
-                      if (change.type === "add") {
-                        const result = yield* files.create({
-                          target: change.target,
-                          content:
-                            change.contents.endsWith("\n") || change.contents === ""
-                              ? change.contents
-                              : `${change.contents}\n`,
-                        })
-                        applied.push({ type: change.type, resource: result.resource, target: result.target })
-                        return
+                      const duplicate = batch.targets.find(
+                        (target, index) =>
+                          batch.targets.findIndex((item) => item.canonical === target.canonical) !== index,
+                      )
+                      if (duplicate)
+                        return yield* fail(
+                          duplicate.resource,
+                          "A patch may target each canonical file only once; combine conflicting operations into one hunk",
+                        )
+                      const prepared: Prepared[] = []
+                      for (const [index, item] of targets.entries()) {
+                        const hunk = item.hunk
+                        const target = batch.targets[index]
+                        yield* Effect.gen(function* () {
+                          if (hunk.type === "add") {
+                            prepared.push({
+                              ...hunk,
+                              target,
+                              before: "",
+                              after:
+                                hunk.contents.endsWith("\n") || hunk.contents === ""
+                                  ? hunk.contents
+                                  : `${hunk.contents}\n`,
+                            })
+                            return
+                          }
+                          if ((yield* fs.stat(target.canonical)).type !== "File") yield* fail(hunk.path)
+                          const source = yield* fs.readFile(target.canonical)
+                          yield* batch
+                            .requireReceipt({ sessionID: context.sessionID, target, content: source })
+                            .pipe(
+                              Effect.mapError(() =>
+                                fail(
+                                  hunk.path,
+                                  "Read this file with the read tool immediately before applying the patch, then retry with its current contents",
+                                ),
+                              ),
+                            )
+                          const original = new TextDecoder("utf-8", { ignoreBOM: true }).decode(source)
+                          const before = original.replace(/^\uFEFF/, "")
+                          if (hunk.type === "delete") {
+                            prepared.push({ ...hunk, target, source, before, after: "" })
+                            return
+                          }
+                          const update = Patch.derive(hunk.path, hunk.chunks, original)
+                          prepared.push({
+                            ...hunk,
+                            target,
+                            source,
+                            content: Patch.joinBom(update.content, update.bom),
+                            before,
+                            after: update.content,
+                          })
+                        }).pipe(Effect.mapError((error) => (error instanceof ToolFailure ? error : fail(hunk.path))))
                       }
-                      if (change.type === "delete") {
-                        const result = yield* files.remove({ target: change.target })
-                        applied.push({ type: change.type, resource: result.resource, target: result.target })
-                        return
-                      }
-                      const result = yield* files.writeIfUnchanged({
-                        target: change.target,
-                        expected: change.source,
-                        content: change.content,
-                      })
-                      applied.push({ type: change.type, resource: result.resource, target: result.target })
-                    }).pipe(Effect.mapError(() => fail(change.path))),
-                  { discard: true },
+
+                      const patchFiles = prepared.map(patchFile)
+                      yield* Effect.forEach(
+                        prepared,
+                        (change) =>
+                          Effect.gen(function* () {
+                            if (change.type === "add") {
+                              yield* batch.invalidateReceipt({ sessionID: context.sessionID, target: change.target })
+                              const result = yield* batch.operations.create({
+                                target: change.target,
+                                content:
+                                  change.contents.endsWith("\n") || change.contents === ""
+                                    ? change.contents
+                                    : `${change.contents}\n`,
+                              })
+                              applied.push({ type: change.type, resource: result.resource, target: result.target })
+                              return
+                            }
+                            if (change.type === "delete") {
+                              yield* batch.invalidateReceipt({ sessionID: context.sessionID, target: change.target })
+                              const result = yield* batch.operations.removeIfUnchanged({
+                                target: change.target,
+                                expected: change.source,
+                              })
+                              applied.push({ type: change.type, resource: result.resource, target: result.target })
+                              return
+                            }
+                            yield* batch.invalidateReceipt({ sessionID: context.sessionID, target: change.target })
+                            const result = yield* batch.operations.writeIfUnchanged({
+                              target: change.target,
+                              expected: change.source,
+                              content: change.content,
+                            })
+                            applied.push({ type: change.type, resource: result.resource, target: result.target })
+                          }).pipe(Effect.mapError(() => fail(change.path))),
+                        { discard: true },
+                      )
+                      return { applied, files: patchFiles }
+                    }),
                 )
-                return { applied, files: patchFiles }
               }).pipe(Effect.mapError((error) => (error instanceof ToolFailure ? error : fail("patch"))))
             },
           }),

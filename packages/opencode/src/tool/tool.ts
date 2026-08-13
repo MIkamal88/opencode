@@ -43,6 +43,13 @@ export type Context<M extends Metadata = Metadata> = {
   messages: SessionV1.WithParts[]
   metadata(input: { title?: string; metadata?: M }): Effect.Effect<void>
   ask(input: Omit<PermissionV1.Request, "id" | "sessionID" | "tool">): Effect.Effect<void>
+  /** Internal durable read receipt channel. Never include these values in tool results. */
+  receipt?: {
+    match(input: { canonicalPath: string; digest: string }): Effect.Effect<boolean>
+    invalidate(input: { canonicalPath: string }): Effect.Effect<void>
+    settle(input: { canonicalPath: string; digest: string; release?: () => Effect.Effect<void> }): Effect.Effect<void>
+    pending(): { canonicalPath: string; digest: string; release?: () => Effect.Effect<void> } | undefined
+  }
 }
 
 export interface ExecuteResult<M extends Metadata = Metadata> {
@@ -50,6 +57,19 @@ export interface ExecuteResult<M extends Metadata = Metadata> {
   metadata: M
   output: string
   attachments?: Omit<SessionV1.FilePart, "id" | "sessionID" | "messageID">[]
+}
+
+const ownership = new WeakMap<object, Truncate.Ownership>()
+
+export function attachOwnership<A extends object>(result: A, value: Truncate.Ownership): A {
+  ownership.set(result, value)
+  return result
+}
+
+export function takeOwnership(result: object): Truncate.Ownership | undefined {
+  const value = ownership.get(result)
+  ownership.delete(result)
+  return value
 }
 
 export interface Def<
@@ -131,17 +151,23 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
           if (result.metadata.truncated !== undefined) {
             return result
           }
-          const agent = yield* agents.get(ctx.agent)
-          const truncated = yield* truncate.output(result.output, {}, agent)
-          return {
-            ...result,
-            output: truncated.content,
-            metadata: {
-              ...result.metadata,
-              truncated: truncated.truncated,
-              ...(truncated.truncated && { outputPath: truncated.outputPath }),
-            },
-          }
+          return yield* Effect.uninterruptibleMask((restore) =>
+            Effect.gen(function* () {
+              const agent = yield* restore(agents.get(ctx.agent))
+              const truncated = yield* truncate.output(result.output, {}, agent)
+              const output = {
+                ...result,
+                output: truncated.content,
+                metadata: {
+                  ...result.metadata,
+                  truncated: truncated.truncated,
+                  ...(truncated.truncated && { outputPath: truncated.outputPath }),
+                },
+              }
+              if (!truncated.truncated) return output
+              return attachOwnership(output, truncate.ownership(truncated.outputPath))
+            }),
+          )
         }).pipe(Effect.orDie, Effect.withSpan("Tool.execute", { attributes: attrs }))
       }
       return toolInfo

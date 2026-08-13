@@ -12,6 +12,8 @@ import { makeGlobalNode } from "../effect/app-node"
 
 const makeDatabase = EffectDrizzleSqlite.makeWithDefaults()
 type DatabaseShape = Effect.Success<typeof makeDatabase>
+export type Transaction = Parameters<Parameters<DatabaseShape["transaction"]>[0]>[0]
+export type Client = EffectDrizzleSqlite.EffectSQLiteDatabase | Transaction
 
 export interface Interface {
   db: DatabaseShape

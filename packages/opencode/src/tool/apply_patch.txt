@@ -1,5 +1,7 @@
 Use the `apply_patch` tool to edit files. Your patch language is a stripped‑down, file‑oriented diff format designed to be easy to parse and safe to apply. You can think of it as a high‑level envelope:
 
+You must successfully use `read` on the current contents of every file you update, delete, or move before applying the patch. New files do not require a prior read. A successful patch invalidates those receipts, so read a changed file again before a later mutation.
+
 *** Begin Patch
 [ one or more file sections ]
 *** End Patch

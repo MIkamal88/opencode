@@ -49,6 +49,7 @@ function harness(input: {
     }),
     Layer.mock(Truncate.Service, {
       output: (text: string) => Effect.succeed({ content: text, truncated: false as const }),
+      ownership: () => ({ retain: () => Effect.void, discard: () => Effect.void }),
     }),
     Layer.mock(Agent.Service, {
       get: () => Effect.succeed({ name: "build", permission: input.permission ?? [] } as any),

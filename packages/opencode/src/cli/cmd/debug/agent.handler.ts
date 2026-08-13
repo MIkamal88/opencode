@@ -6,7 +6,6 @@ import { Cause, Effect } from "effect"
 import { Agent } from "../../../agent/agent"
 import { Provider } from "@/provider/provider"
 import { Session } from "@/session/session"
-import type { MessageV2 } from "../../../session/message-v2"
 import { MessageID, PartID } from "../../../session/schema"
 import { ToolRegistry } from "@/tool/registry"
 import { Permission } from "../../../permission"
@@ -14,6 +13,7 @@ import { iife } from "../../../util/iife"
 import { fail } from "../../effect-cmd"
 import { InstanceRef } from "@/effect/instance-ref"
 import type { InstanceContext } from "@/project/instance-context"
+import { Tool } from "@/tool/tool"
 
 export const debugAgent = Effect.fn("Cli.debug.agent")(function* (args: {
   name: string
@@ -52,8 +52,25 @@ const run = Effect.fn("Cli.debug.agent.body")(function* (
     }
     const params = parseToolParams(args.params)
     const toolCtx = yield* createToolContext(agent, ctx)
-    const result = yield* tool.execute(params, toolCtx)
-    process.stdout.write(JSON.stringify({ tool: toolID, input: params, result }, null, 2) + EOL)
+    yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const result = yield* restore(tool.execute(params, toolCtx))
+        const ownership = Tool.takeOwnership(result)
+        const output = yield* Effect.sync(() => JSON.stringify({ tool: toolID, input: params, result }, null, 2)).pipe(
+          Effect.onError(() => ownership?.discard() ?? Effect.void),
+        )
+        yield* Effect.tryPromise(
+          () =>
+            new Promise<void>((resolve, reject) => {
+              process.stdout.write(output + EOL, (error) => (error ? reject(error) : resolve()))
+            }),
+        ).pipe(
+          Effect.onError(() => ownership?.discard() ?? Effect.void),
+          Effect.orDie,
+        )
+        yield* ownership?.retain() ?? Effect.void
+      }),
+    )
     return
   }
 

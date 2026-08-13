@@ -21,6 +21,7 @@ import { ReadTool } from "@opencode-ai/core/tool/read"
 import { ReadToolFileSystem } from "@opencode-ai/core/tool/read-filesystem"
 import { testEffect } from "./lib/effect"
 import { toolIdentity, executeTool, settleTool, toolDefinitions } from "./lib/tool"
+import { createHash } from "node:crypto"
 
 const assertions: PermissionV2.AssertInput[] = []
 const missingPath = "__missing_read_target__.txt"
@@ -40,15 +41,29 @@ let readResult: FileSystem.Content | ReadToolFileSystem.TextPage = {
   mime: "text/plain",
 }
 let readFailure: ReadToolFileSystem.ReadError | undefined
+let inspectCalls = 0
 let configEntries: Config.Entry[] = []
+let recanonicalizedPath: string | undefined
 const reader = Layer.succeed(
   ReadToolFileSystem.Service,
   ReadToolFileSystem.Service.of({
-    inspect: () => (resolveFailure === undefined ? Effect.succeed(resolvedType) : Effect.die(resolveFailure)),
+    inspect: () => {
+      inspectCalls++
+      return resolveFailure === undefined ? Effect.succeed(resolvedType) : Effect.die(resolveFailure)
+    },
     read: (input, _resource, page = {}) => {
       readCalls.push({ input, page })
       if (readFailure !== undefined) return Effect.fail(readFailure)
       return Effect.succeed(readResult)
+    },
+    readReceipt: (input, _resource, page = {}) => {
+      readCalls.push({ input, page })
+      if (readFailure !== undefined) return Effect.fail(readFailure)
+      const raw =
+        "encoding" in readResult && readResult.encoding === "base64"
+          ? Buffer.from(readResult.content, "base64")
+          : Buffer.from("content" in readResult ? readResult.content : "")
+      return Effect.succeed({ value: readResult, digest: createHash("sha256").update(raw).digest("hex") })
     },
     list: (_path, input = {}) =>
       Effect.sync(() => {
@@ -80,17 +95,19 @@ const testFileSystem = Layer.effect(
     Effect.succeed(
       FSUtil.Service.of({
         ...fs,
-        realPath: (path) =>
-          path === missingAbsolutePath
-            ? Effect.fail(
-                PlatformError.systemError({
-                  _tag: "NotFound",
-                  module: "FileSystem",
-                  method: "realPath",
-                  pathOrDescriptor: path,
-                }),
-              )
-            : Effect.succeed(path),
+        realPath: (inputPath) =>
+          recanonicalizedPath && inputPath === path.resolve(process.cwd(), "README.md")
+            ? Effect.succeed(recanonicalizedPath)
+            : inputPath === missingAbsolutePath
+              ? Effect.fail(
+                  PlatformError.systemError({
+                    _tag: "NotFound",
+                    module: "FileSystem",
+                    method: "realPath",
+                    pathOrDescriptor: inputPath,
+                  }),
+                )
+              : Effect.succeed(inputPath),
       }),
     ),
   ),
@@ -161,7 +178,9 @@ describe("ReadTool", () => {
       mime: "text/plain",
     }
     readFailure = undefined
+    inspectCalls = 0
     configEntries = []
+    recanonicalizedPath = undefined
   })
 
   it.effect("registers, authorizes, and reads through the location filesystem", () =>
@@ -217,6 +236,23 @@ describe("ReadTool", () => {
         { sessionID, action: "read", resources: [external.replaceAll("\\", "/")], save: ["*"] },
       ])
       expect(readCalls).toEqual([{ input: AbsolutePath.make(external), page: { offset: undefined, limit: undefined } }])
+    }),
+  )
+
+  it.effect("rejects a target recanonicalized after read approval before inspecting it", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      recanonicalizedPath = path.resolve(path.parse(process.cwd()).root, "external-read", "README.md")
+
+      expect(
+        yield* executeTool(registry, {
+          sessionID,
+          ...toolIdentity,
+          call: { type: "tool-call", id: "call-stale-read", name: "read", input: { path: "README.md" } },
+        }),
+      ).toEqual({ type: "error", value: "Unable to read README.md" })
+      expect(inspectCalls).toBe(0)
+      expect(readCalls).toEqual([])
     }),
   )
 
@@ -293,20 +329,11 @@ describe("ReadTool", () => {
         call: { type: "tool-call", id: "call-large-image", name: "read", input: { path: "large.png" } },
       })
 
-      expect(settled.outputPaths).toBeUndefined()
+      expect(settled.outputPaths).toHaveLength(1)
       expect(settled.output?.structured).toMatchObject({
-        uri: "file:///large.png",
-        name: "large.png",
-        mime: "image/png",
-        encoding: "base64",
+        truncated: true,
       })
-      expect(settled.result).toEqual({
-        type: "content",
-        value: [
-          { type: "text", text: "Image read successfully" },
-          { type: "file", uri: `data:image/png;base64,${png}`, mime: "image/png", name: "large.png" },
-        ],
-      })
+      expect(settled.result).toMatchObject({ type: "text", value: expect.stringContaining("full content saved") })
     }),
   )
 
@@ -541,6 +568,7 @@ describe("ReadTool", () => {
         }),
       ).toEqual({ type: "error", value: "Unable to read README.md" })
       expect(readCalls).toEqual([])
+      expect(inspectCalls).toBe(0)
     }),
   )
 
@@ -596,6 +624,7 @@ describe("ReadTool", () => {
         }),
       ).toEqual({ type: "error", value: "Unable to read src" })
       expect(listCalls).toEqual([])
+      expect(inspectCalls).toBe(0)
     }),
   )
 

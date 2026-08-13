@@ -9,9 +9,11 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Location } from "@opencode-ai/core/location"
 import { LocationMutation } from "@opencode-ai/core/location-mutation"
 import { AbsolutePath } from "@opencode-ai/core/schema"
+import { SessionV2 } from "@opencode-ai/core/session"
 import { location } from "./fixture/location"
 import { tmpdir } from "./fixture/tmpdir"
 import { it } from "./lib/effect"
+import { FileLockCoordinator } from "@opencode-ai/core/file-lock-coordinator"
 
 function provide(directory: string, filesystemLayer = LayerNode.compile(FSUtil.node)) {
   const activeLocation = Layer.succeed(
@@ -68,6 +70,74 @@ describe("FileMutation", () => {
         })
         expect(yield* Effect.promise(() => fs.readFile(result.target, "utf8"))).toBe("hello")
       }).pipe(provide(directory)),
+    ),
+  )
+
+  it.live("rejects a read when an approved ancestor resolves to a different target", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => Promise.all([tmpdir(), tmpdir()])),
+      ([directory, outside]) =>
+        Effect.gen(function* () {
+          const ancestor = path.join(directory.path, "sub")
+          yield* Effect.promise(() => fs.mkdir(ancestor))
+          const target = yield* (yield* LocationMutation.Service).resolve({ path: "sub/file.txt" })
+          yield* Effect.promise(() => fs.rm(ancestor, { recursive: true }))
+          yield* Effect.promise(() => fs.symlink(outside.path, ancestor, "dir"))
+          let read = false
+
+          expect(
+            yield* (yield* FileMutation.Service)
+              .readReceipt({
+                target,
+                read: Effect.sync(() => {
+                  read = true
+                  return { value: "outside", digest: "0".repeat(64) }
+                }),
+              })
+              .pipe(Effect.flip),
+          ).toMatchObject({ _tag: "FileMutation.StaleContentError", path: target.canonical })
+          expect(read).toBeFalse()
+        }).pipe(provide(directory.path)),
+      ([directory, outside]) =>
+        Effect.promise(() =>
+          Promise.all([directory[Symbol.asyncDispose](), outside[Symbol.asyncDispose]()]).then(() => undefined),
+        ),
+    ),
+  )
+
+  it.live("rejects a retained write when an approved ancestor resolves outside the location", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => Promise.all([tmpdir(), tmpdir()])),
+      ([directory, outside]) =>
+        Effect.gen(function* () {
+          const ancestor = path.join(directory.path, "sub")
+          yield* Effect.promise(() => fs.mkdir(ancestor))
+          const target = yield* (yield* LocationMutation.Service).resolve({ path: "sub/file.txt" })
+          yield* Effect.promise(() => fs.rm(ancestor, { recursive: true }))
+          yield* Effect.promise(() => fs.symlink(outside.path, ancestor, "dir"))
+
+          expect(
+            yield* (yield* FileMutation.Service)
+              .createOrCheckedOverwriteText({
+                sessionID: SessionV2.ID.make("ses_stale_authorization"),
+                target,
+                content: "blocked",
+              })
+              .pipe(Effect.flip),
+          ).toMatchObject({ _tag: "FileMutation.StaleContentError", path: target.canonical })
+          expect(
+            yield* Effect.promise(() =>
+              fs.stat(path.join(outside.path, "file.txt")).then(
+                () => true,
+                () => false,
+              ),
+            ),
+          ).toBeFalse()
+        }).pipe(provide(directory.path)),
+      ([directory, outside]) =>
+        Effect.promise(() =>
+          Promise.all([directory[Symbol.asyncDispose](), outside[Symbol.asyncDispose]()]).then(() => undefined),
+        ),
     ),
   )
 
@@ -347,6 +417,108 @@ describe("FileMutation", () => {
           yield* Fiber.join(second)
         }).pipe(provide(directory, filesystem))
       }),
+    ),
+  )
+
+  it.live("canonicalizes symlink aliases and missing descendants through the nearest existing ancestor", () =>
+    withTmp((directory) =>
+      Effect.gen(function* () {
+        const real = path.join(directory, "real")
+        const alias = path.join(directory, "alias")
+        yield* Effect.promise(() => fs.mkdir(real))
+        yield* Effect.promise(() => fs.symlink(real, alias, "dir"))
+        const filesystem = yield* FSUtil.Service
+
+        expect(yield* FileLockCoordinator.canonical(filesystem, path.join(alias, "nested", "file.txt"))).toBe(
+          path.join(real, "nested", "file.txt"),
+        )
+        expect(
+          yield* FileLockCoordinator.keys(filesystem, [
+            path.join(alias, "nested", "file.txt"),
+            path.join(real, "nested", "file.txt"),
+          ]),
+        ).toEqual([`path:${path.join(real, "nested", "file.txt")}`])
+      }).pipe(Effect.provide(LayerNode.compile(FSUtil.node))),
+    ),
+  )
+
+  it.live("serializes existing hard-link aliases by filesystem identity", () =>
+    withTmp((directory) =>
+      Effect.gen(function* () {
+        const filesystem = yield* FSUtil.Service
+        const target = path.join(directory, "target.txt")
+        const alias = path.join(directory, "alias.txt")
+        yield* Effect.promise(() => fs.writeFile(target, "content"))
+        yield* Effect.promise(() => fs.link(target, alias))
+        const entered = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        const secondEntered = yield* Deferred.make<void>()
+        const first = yield* FileLockCoordinator.withLocks(
+          yield* FileLockCoordinator.keys(filesystem, [target]),
+          Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        ).pipe(Effect.forkChild)
+        yield* Deferred.await(entered)
+        const second = yield* FileLockCoordinator.withLocks(
+          yield* FileLockCoordinator.keys(filesystem, [alias]),
+          Deferred.succeed(secondEntered, undefined),
+        ).pipe(Effect.forkChild)
+        yield* Effect.yieldNow
+        expect(yield* Deferred.isDone(secondEntered)).toBeFalse()
+
+        yield* Deferred.succeed(release, undefined)
+        yield* Deferred.await(secondEntered)
+        yield* Fiber.join(first)
+        yield* Fiber.join(second)
+      }).pipe(Effect.provide(LayerNode.compile(FSUtil.node))),
+    ),
+  )
+
+  it.live("releases acquired locks exactly once after failure or interruption", () =>
+    withTmp((directory) =>
+      Effect.gen(function* () {
+        const filesystem = yield* FSUtil.Service
+        const target = path.join(directory, "release.txt")
+        const lockKeys = yield* FileLockCoordinator.keys(filesystem, [target])
+        const lease = yield* FileLockCoordinator.acquireLocks(lockKeys)
+        yield* lease.release
+        yield* lease.release
+
+        const entered = yield* Deferred.make<void>()
+        const interrupted = yield* FileLockCoordinator.withLocks(
+          lockKeys,
+          Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+        ).pipe(Effect.forkChild)
+        yield* Deferred.await(entered)
+        yield* Fiber.interrupt(interrupted)
+        yield* FileLockCoordinator.withLocks(lockKeys, Effect.void)
+        yield* FileLockCoordinator.withLocks(lockKeys, Effect.fail("failed")).pipe(Effect.exit)
+        yield* FileLockCoordinator.withLocks(lockKeys, Effect.void)
+      }).pipe(Effect.provide(LayerNode.compile(FSUtil.node))),
+    ),
+  )
+
+  it.live("acquires opposite-order batches without deadlock", () =>
+    withTmp((directory) =>
+      Effect.gen(function* () {
+        const filesystem = yield* FSUtil.Service
+        const first = path.join(directory, "first.txt")
+        const second = path.join(directory, "second.txt")
+        const entered = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        const left = yield* FileLockCoordinator.withLocks(
+          yield* FileLockCoordinator.keys(filesystem, [first, second]),
+          Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        ).pipe(Effect.forkChild)
+        yield* Deferred.await(entered)
+        const right = yield* FileLockCoordinator.withLocks(
+          yield* FileLockCoordinator.keys(filesystem, [second, first, second]),
+          Effect.void,
+        ).pipe(Effect.forkChild)
+
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.join(left)
+        yield* Fiber.join(right)
+      }).pipe(Effect.provide(LayerNode.compile(FSUtil.node))),
     ),
   )
 })

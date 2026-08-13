@@ -1,14 +1,12 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { afterEach, describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Cause, Effect, Exit, Layer, Stream } from "effect"
+import { Cause, Effect, Exit, Layer } from "effect"
 import path from "path"
+import fs from "fs/promises"
 import { Agent } from "../../src/agent/agent"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { FSUtil } from "@opencode-ai/core/fs-util"
-import { Global } from "@opencode-ai/core/global"
-import { Config } from "@/config/config"
-import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { LSP } from "@/lsp/lsp"
 import { Permission } from "../../src/permission"
@@ -18,6 +16,7 @@ import { ReadTool } from "../../src/tool/read"
 import { Truncate } from "@/tool/truncate"
 import { Tool } from "@/tool/tool"
 import { Filesystem } from "@/util/filesystem"
+import { FileMutationState } from "@/tool/file-mutation-state"
 import {
   disposeAllInstances,
   provideInstance,
@@ -44,7 +43,7 @@ const ctx = {
   ask: () => Effect.void,
 }
 
-const readLayer = (flags: Partial<RuntimeFlags.Info> = {}) =>
+const readLayer = () =>
   LayerNode.compile(
     LayerNode.group([
       Agent.node,
@@ -54,6 +53,7 @@ const readLayer = (flags: Partial<RuntimeFlags.Info> = {}) =>
       LSP.node,
       Ripgrep.node,
       Truncate.node,
+      FileMutationState.node,
     ]),
   )
 
@@ -96,36 +96,6 @@ const fail = Effect.fn("ReadToolTest.fail")(function* (
 const full = (p: string) => (process.platform === "win32" ? Filesystem.normalizePath(p) : p)
 const glob = (p: string) =>
   process.platform === "win32" ? Filesystem.normalizePathPattern(p) : p.replaceAll("\\", "/")
-const githubBase = <A, E, R>(url: string, self: Effect.Effect<A, E, R>) =>
-  Effect.acquireUseRelease(
-    Effect.sync(() => {
-      const previous = process.env.OPENCODE_REPO_CLONE_GITHUB_BASE_URL
-      process.env.OPENCODE_REPO_CLONE_GITHUB_BASE_URL = url
-      return previous
-    }),
-    () => self,
-    (previous) =>
-      Effect.sync(() => {
-        if (previous) process.env.OPENCODE_REPO_CLONE_GITHUB_BASE_URL = previous
-        else delete process.env.OPENCODE_REPO_CLONE_GITHUB_BASE_URL
-      }),
-  )
-const git = Effect.fn("ReadToolTest.git")(function* (cwd: string, args: string[]) {
-  return yield* Effect.promise(async () => {
-    const proc = Bun.spawn(["git", ...args], {
-      cwd,
-      stdout: "pipe",
-      stderr: "pipe",
-    })
-    const [stdout, stderr, code] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ])
-    if (code !== 0) throw new Error(stderr.trim() || stdout.trim() || `git ${args.join(" ")} failed`)
-    return stdout.trim()
-  })
-})
 const put = Effect.fn("ReadToolTest.put")(function* (p: string, content: string | Buffer | Uint8Array) {
   const fs = yield* FSUtil.Service
   yield* fs.writeWithDirs(p, content)
@@ -147,6 +117,187 @@ const asks = () => {
     },
   }
 }
+
+describe("tool.read receipts", () => {
+  it.instance("settles exact full bytes for partial reads", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filepath = path.join(test.directory, "partial.txt")
+      const bytes = Buffer.from("\uFEFFone\r\ntwo\r\nthree\r\n")
+      yield* put(filepath, bytes)
+      const settled: Array<{ canonicalPath: string; digest: string }> = []
+      yield* run(
+        { filePath: filepath, offset: 2, limit: 1 },
+        {
+          ...ctx,
+          receipt: {
+            match: () => Effect.succeed(false),
+            invalidate: () => Effect.void,
+            settle: (input) => Effect.sync(() => void settled.push(input)),
+            pending: () => settled.at(-1),
+          },
+        },
+      )
+      expect(settled).toEqual([
+        { canonicalPath: filepath, digest: new Bun.CryptoHasher("sha256").update(bytes).digest("hex") },
+      ])
+    }),
+  )
+
+  it.instance("keeps partial text buffering bounded while hashing the complete file", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filepath = path.join(test.directory, "large.txt")
+      const chunk = Buffer.from(`${"x".repeat(63)}\n`)
+      const repeats = 16_384
+      yield* put(filepath, Buffer.concat(Array.from({ length: repeats }, () => chunk)))
+      const settled: Array<{ canonicalPath: string; digest: string }> = []
+      let largestChunk = 0
+      const mutations = yield* FileMutationState.Service
+      const result = yield* run(
+        { filePath: filepath, limit: 1 },
+        {
+          ...ctx,
+          receipt: {
+            match: () => Effect.succeed(false),
+            invalidate: () => Effect.void,
+            settle: (input) => Effect.sync(() => void settled.push(input)),
+            pending: () => settled.at(-1),
+          },
+        },
+      ).pipe(
+        Effect.provideService(
+          FileMutationState.Service,
+          FileMutationState.Service.of({
+            ...mutations,
+            read: (target, consume) =>
+              mutations.read(target, (chunk) =>
+                Effect.sync(() => {
+                  largestChunk = Math.max(largestChunk, chunk.length)
+                  if (chunk.length > 64 * 1024) throw new Error(`read chunk exceeded bound: ${chunk.length}`)
+                }).pipe(Effect.andThen(consume(chunk))),
+              ),
+          }),
+        ),
+      )
+
+      expect(result.output).toContain(`1: ${"x".repeat(63)}`)
+      expect(settled[0]?.digest).toBe(
+        new Bun.CryptoHasher("sha256")
+          .update(Buffer.concat(Array.from({ length: repeats }, () => chunk)))
+          .digest("hex"),
+      )
+      expect(largestChunk).toBe(64 * 1024)
+    }),
+  )
+
+  it.instance("renders partial text from the same snapshot used for the receipt", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filepath = path.join(test.directory, "snapshot.txt")
+      yield* put(filepath, "first\nsecond\n")
+      const settled: Array<{ canonicalPath: string; digest: string }> = []
+      const mutations = yield* FileMutationState.Service
+      let opens = 0
+      const result = yield* run(
+        { filePath: filepath, limit: 1 },
+        {
+          ...ctx,
+          receipt: {
+            match: () => Effect.succeed(false),
+            invalidate: () => Effect.void,
+            settle: (input) => Effect.sync(() => void settled.push(input)),
+            pending: () => settled.at(-1),
+          },
+        },
+      ).pipe(
+        Effect.provideService(
+          FileMutationState.Service,
+          FileMutationState.Service.of({
+            ...mutations,
+            read: (target, consume) => {
+              opens++
+              return mutations.read(target, consume)
+            },
+          }),
+        ),
+      )
+
+      expect(result.output).toContain("1: first")
+      expect(settled[0]?.digest).toBe(new Bun.CryptoHasher("sha256").update("first\nsecond\n").digest("hex"))
+      expect(opens).toBe(1)
+    }),
+  )
+
+  it.instance("rejects malformed UTF-8 without settling a receipt", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filepath = path.join(test.directory, "malformed.txt")
+      const bytes = Buffer.concat([Buffer.alloc(4096, 0x61), Buffer.from([0xff]), Buffer.from("\neditable\n")])
+      yield* put(filepath, bytes)
+      const settled: Array<{ canonicalPath: string; digest: string }> = []
+      const exit = yield* run(
+        { filePath: filepath },
+        {
+          ...ctx,
+          receipt: {
+            match: () => Effect.succeed(false),
+            invalidate: () => Effect.void,
+            settle: (input) => Effect.sync(() => void settled.push(input)),
+            pending: () => settled.at(-1),
+          },
+        },
+      ).pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBeTrue()
+      if (Exit.isFailure(exit)) expect(Cause.pretty(exit.cause)).toContain("malformed UTF-8")
+      expect(settled).toEqual([])
+    }),
+  )
+
+  it.instance("does not settle directory receipts", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const settled: Array<{ canonicalPath: string; digest: string }> = []
+      yield* run(
+        { filePath: test.directory },
+        {
+          ...ctx,
+          receipt: {
+            match: () => Effect.succeed(false),
+            invalidate: () => Effect.void,
+            settle: (input) => Effect.sync(() => void settled.push(input)),
+            pending: () => settled.at(-1),
+          },
+        },
+      )
+      expect(settled).toEqual([])
+    }),
+  )
+
+  it.instance("settles image receipts using the exact attachment bytes", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filepath = path.join(test.directory, "image.png")
+      const bytes = Buffer.from("89504e470d0a1a0a0000000d49484452", "hex")
+      yield* put(filepath, bytes)
+      const settled: Array<{ canonicalPath: string; digest: string }> = []
+      yield* run(
+        { filePath: filepath },
+        {
+          ...ctx,
+          receipt: {
+            match: () => Effect.succeed(false),
+            invalidate: () => Effect.void,
+            settle: (input) => Effect.sync(() => void settled.push(input)),
+            pending: () => settled.at(-1),
+          },
+        },
+      )
+      expect(settled[0]?.digest).toBe(new Bun.CryptoHasher("sha256").update(bytes).digest("hex"))
+    }),
+  )
+})
 
 describe("tool.read external_directory permission", () => {
   it.live("allows reading absolute path inside project directory", () =>
@@ -257,6 +408,22 @@ describe("tool.read external_directory permission", () => {
       expect(ext).toBeUndefined()
     }),
   )
+
+  it.live("authorizes the canonical target of a symlink", () =>
+    Effect.gen(function* () {
+      const outer = yield* tmpdirScoped()
+      const dir = yield* tmpdirScoped({ git: true })
+      const target = path.join(outer, "secret.txt")
+      const alias = path.join(dir, "alias.txt")
+      yield* put(target, "secret")
+      yield* Effect.promise(() => fs.symlink(target, alias))
+      const { items, next } = asks()
+
+      yield* exec(dir, { filePath: alias }, next)
+      const ext = items.find((item) => item.permission === "external_directory")
+      expect(ext?.patterns).toContain(glob(path.join(outer, "*")))
+    }),
+  )
 })
 
 describe("tool.read env file permissions", () => {
@@ -328,27 +495,27 @@ describe("tool.read truncation", () => {
     }),
   )
 
-  it.instance("stops streaming after the byte cap", () =>
+  it.instance("validates the full file in bounded chunks after reaching the byte cap", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
       const filepath = path.join(test.directory, "huge.txt")
       const content = `${"x".repeat(80)}\n`.repeat(50_000)
       yield* put(filepath, content)
 
-      const fs = yield* FSUtil.Service
-      const counter = { bytes: 0 }
+      const mutations = yield* FileMutationState.Service
+      let bytes = 0
+      let largestChunk = 0
       const result = yield* run({ filePath: filepath }).pipe(
         Effect.provideService(
-          FSUtil.Service,
-          FSUtil.Service.of({
-            ...fs,
-            stream: (file, options) =>
-              fs.stream(file, options).pipe(
-                Stream.tap((chunk) =>
-                  Effect.sync(() => {
-                    counter.bytes += chunk.length
-                  }),
-                ),
+          FileMutationState.Service,
+          FileMutationState.Service.of({
+            ...mutations,
+            read: (target, consume) =>
+              mutations.read(target, (chunk) =>
+                Effect.sync(() => {
+                  bytes += chunk.length
+                  largestChunk = Math.max(largestChunk, chunk.length)
+                }).pipe(Effect.andThen(consume(chunk))),
               ),
           }),
         ),
@@ -356,7 +523,8 @@ describe("tool.read truncation", () => {
 
       expect(result.metadata.truncated).toBe(true)
       expect(result.output).toContain("Output capped at")
-      expect(counter.bytes).toBeLessThan(Buffer.byteLength(content, "utf-8") / 2)
+      expect(bytes).toBe(Buffer.byteLength(content, "utf-8"))
+      expect(largestChunk).toBeLessThanOrEqual(64 * 1024)
     }),
   )
 

@@ -1,4 +1,4 @@
-import { Effect, Option, Schema, Scope, Stream } from "effect"
+import { Effect, Schema, Scope } from "effect"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
 import * as path from "path"
 import * as Tool from "./tool"
@@ -9,16 +9,16 @@ import { InstanceState } from "@/effect/instance-state"
 import { assertExternalDirectoryEffect } from "./external-directory"
 import { Instruction } from "../session/instruction"
 import { isPdfAttachment, sniffAttachmentMime } from "@/util/media"
+import { FileMutationState } from "./file-mutation-state"
 
 const DEFAULT_READ_LIMIT = 2000
 const MAX_LINE_LENGTH = 2000
 const MAX_LINE_SUFFIX = `... (line truncated to ${MAX_LINE_LENGTH} chars)`
 const MAX_BYTES = 50 * 1024
 const MAX_BYTES_LABEL = `${MAX_BYTES / 1024} KB`
+const MAX_MEDIA_INGEST_BYTES = 20 * 1024 * 1024
 const SAMPLE_BYTES = 4096
 const SUPPORTED_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"])
-
-class ReadStop extends Schema.TaggedErrorClass<ReadStop>()("ReadStop", {}) {}
 
 // `offset` and `limit` were originally `z.coerce.number()` — the runtime
 // coercion was useful when the tool was called from a shell but serves no
@@ -64,7 +64,7 @@ type Metadata = {
 export const ReadTool = Tool.define<
   typeof Parameters,
   Metadata,
-  FSUtil.Service | Instruction.Service | LSP.Service | Scope.Scope
+  FSUtil.Service | Instruction.Service | LSP.Service | FileMutationState.Service | Scope.Scope
 >(
   "read",
   Effect.gen(function* () {
@@ -72,6 +72,7 @@ export const ReadTool = Tool.define<
     const instruction = yield* Instruction.Service
     const lsp = yield* LSP.Service
     const scope = yield* Scope.Scope
+    const mutations = yield* FileMutationState.Service
 
     const miss = Effect.fn("ReadTool.miss")(function* (filepath: string) {
       const dir = path.dirname(filepath)
@@ -119,64 +120,121 @@ export const ReadTool = Tool.define<
       yield* lsp.touchFile(filepath).pipe(Effect.ignoreCause, Effect.forkIn(scope))
     })
 
-    const readSample = Effect.fn("ReadTool.readSample")(function* (
+    const readFile = Effect.fn("ReadTool.readFile")(function* (
       filepath: string,
-      fileSize: number,
-      sampleSize: number,
+      opts: { limit: number; offset: number },
     ) {
-      if (fileSize === 0) return new Uint8Array()
-
-      return yield* Effect.scoped(
-        Effect.gen(function* () {
-          const file = yield* fs.open(filepath, { flag: "r" })
-          return Option.getOrElse(yield* file.readAlloc(Math.min(sampleSize, fileSize)), () => new Uint8Array())
+      const raw: string[] = []
+      const mediaChunks: Uint8Array[] = []
+      const decoder = new TextDecoder("utf-8", { fatal: true })
+      let mediaMime: string | undefined
+      let first = true
+      let pending = ""
+      let discard = false
+      let count = 0
+      let bytes = 0
+      let cut = false
+      let nonPrintable = 0
+      let total = 0
+      const append = (value: string) => {
+        count++
+        if (count < opts.offset || raw.length >= opts.limit || cut) return
+        const line = value.length > MAX_LINE_LENGTH ? value.slice(0, MAX_LINE_LENGTH) + MAX_LINE_SUFFIX : value
+        const size = Buffer.byteLength(line, "utf-8") + (raw.length > 0 ? 1 : 0)
+        if (bytes + size > MAX_BYTES) {
+          cut = true
+          return
+        }
+        raw.push(line)
+        bytes += size
+      }
+      const consume = (input: string) => {
+        let text = input
+        while (true) {
+          const index = text.indexOf("\n")
+          if (index === -1) {
+            if (!discard) {
+              pending += text
+              if (pending.length > MAX_LINE_LENGTH) {
+                pending = pending.slice(0, MAX_LINE_LENGTH + 1)
+                discard = true
+              }
+            }
+            break
+          }
+          const current = pending + (discard ? "" : text.slice(0, index))
+          pending = ""
+          discard = false
+          text = text.slice(index + 1)
+          append(current.endsWith("\r") ? current.slice(0, -1) : current)
+        }
+      }
+      const decoded = yield* mutations.read(
+        filepath,
+        Effect.fnUntraced(function* (chunk) {
+          if (first) {
+            first = false
+            const mime = sniffAttachmentMime(chunk.subarray(0, SAMPLE_BYTES), FSUtil.mimeType(filepath))
+            if (SUPPORTED_IMAGE_MIMES.has(mime) || isPdfAttachment(mime)) mediaMime = mime
+            else if (isBinaryFile(filepath, chunk.subarray(0, SAMPLE_BYTES)))
+              return yield* Effect.fail(new Error(`Cannot read binary file: ${filepath}`))
+          }
+          total += chunk.length
+          if (mediaMime) {
+            if (total > MAX_MEDIA_INGEST_BYTES) {
+              return yield* Effect.fail(
+                new Error(`Media exceeds ${MAX_MEDIA_INGEST_BYTES} byte ingestion limit: ${filepath}`),
+              )
+            }
+            mediaChunks.push(chunk)
+            return
+          }
+          for (const byte of chunk) {
+            if (byte === 0) return yield* Effect.fail(new Error(`Cannot read binary file: ${filepath}`))
+            if (byte < 9 || (byte > 13 && byte < 32)) nonPrintable++
+          }
+          try {
+            consume(decoder.decode(chunk, { stream: true }))
+          } catch (error) {
+            return yield* Effect.fail(
+              new Error("File contains malformed UTF-8 and cannot be safely edited.", { cause: error }),
+            )
+          }
+          return
         }),
       )
-    })
-
-    const lines = Effect.fn("ReadTool.lines")(function* (filepath: string, opts: { limit: number; offset: number }) {
-      const start = opts.offset - 1
-      const raw: string[] = []
-      const flags = { bytes: 0, count: 0, cut: false, more: false, done: false }
-
-      // Note: prefer manual TextDecoder over Stream.decodeText — when the source stream
-      // ends without flushing, decodeText drops the final unterminated line. We also
-      // avoid Stream.runForEachWhile (it currently swallows the final unterminated
-      // line of the upstream splitLines pipeline) and use a tagged error to stop the
-      // upstream file stream as soon as the byte cap is reached.
-      const decoder = new TextDecoder("utf-8")
-      yield* fs.stream(filepath).pipe(
-        Stream.map((bytes) => decoder.decode(bytes, { stream: true })),
-        Stream.splitLines,
-        Stream.runForEach((text) =>
-          Effect.gen(function* () {
-            if (flags.done) return yield* new ReadStop()
-            flags.count += 1
-            if (flags.count <= start) return
-
-            if (raw.length >= opts.limit) {
-              flags.more = true
-              return
-            }
-
-            const line = text.length > MAX_LINE_LENGTH ? text.substring(0, MAX_LINE_LENGTH) + MAX_LINE_SUFFIX : text
-            const size = Buffer.byteLength(line, "utf-8") + (raw.length > 0 ? 1 : 0)
-            if (flags.bytes + size <= MAX_BYTES) {
-              raw.push(line)
-              flags.bytes += size
-              return
-            }
-
-            flags.cut = true
-            flags.more = true
-            flags.done = true
-            return yield* new ReadStop()
-          }),
-        ),
-        Effect.catchTag("ReadStop", () => Effect.void),
-      )
-
-      return { raw, count: flags.count, cut: flags.cut, more: flags.more, offset: opts.offset }
+      if (first && isBinaryFile(filepath, new Uint8Array()))
+        return yield* Effect.fail(new Error(`Cannot read binary file: ${filepath}`))
+      if (mediaMime) {
+        return {
+          type: "media" as const,
+          mime: mediaMime,
+          content: Buffer.concat(
+            mediaChunks.map((chunk) => Buffer.from(chunk)),
+            total,
+          ),
+          digest: decoded.digest,
+        }
+      }
+      try {
+        consume(decoder.decode())
+      } catch (error) {
+        return yield* Effect.fail(
+          new Error("File contains malformed UTF-8 and cannot be safely edited.", { cause: error }),
+        )
+      }
+      if (pending || discard) append(pending.endsWith("\r") ? pending.slice(0, -1) : pending)
+      if (total > 0 && nonPrintable / total > 0.3)
+        return yield* Effect.fail(new Error(`Cannot read binary file: ${filepath}`))
+      return {
+        type: "text" as const,
+        raw,
+        count,
+        cut,
+        more: cut || count > opts.offset - 1 + raw.length,
+        offset: opts.offset,
+        digest: decoded.digest,
+      }
     })
 
     const isBinaryFile = (filepath: string, bytes: Uint8Array) => {
@@ -240,16 +298,18 @@ export const ReadTool = Tool.define<
       }
       const title = path.relative(instance.worktree, filepath)
 
-      const stat = yield* fs.stat(filepath).pipe(
+      const initialStat = yield* fs.stat(filepath).pipe(
         Effect.catchIf(
           (err) => "reason" in err && err.reason._tag === "NotFound",
           () => Effect.succeed(undefined),
         ),
       )
 
-      yield* assertExternalDirectoryEffect(ctx, filepath, {
+      const authorizedPath = yield* mutations.canonical(filepath)
+
+      yield* assertExternalDirectoryEffect(ctx, authorizedPath, {
         bypass: Boolean(ctx.extra?.["bypassCwdCheck"]),
-        kind: stat?.type === "Directory" ? "directory" : "file",
+        kind: initialStat?.type === "Directory" ? "directory" : "file",
       })
 
       yield* ctx.ask({
@@ -259,121 +319,153 @@ export const ReadTool = Tool.define<
         metadata: {},
       })
 
+      const canonicalPath = yield* mutations.canonical(filepath)
+      if (canonicalPath !== authorizedPath) {
+        yield* assertExternalDirectoryEffect(ctx, canonicalPath, {
+          bypass: Boolean(ctx.extra?.["bypassCwdCheck"]),
+          kind: initialStat?.type === "Directory" ? "directory" : "file",
+        })
+      }
+      const stat = yield* fs.stat(canonicalPath).pipe(
+        Effect.catchIf(
+          (err) => "reason" in err && err.reason._tag === "NotFound",
+          () => Effect.succeed(undefined),
+        ),
+      )
       if (!stat) return yield* miss(filepath)
 
       if (stat.type === "Directory") {
-        const items = yield* list(filepath)
-        const limit = params.limit ?? DEFAULT_READ_LIMIT
-        const offset = params.offset || 1
-        const start = offset - 1
-        const sliced = items.slice(start, start + limit)
-        const truncated = start + sliced.length < items.length
+        return yield* mutations.withLock(
+          canonicalPath,
+          Effect.gen(function* () {
+            const checked = yield* mutations.canonical(filepath)
+            if (checked !== canonicalPath) {
+              yield* assertExternalDirectoryEffect(ctx, checked, {
+                bypass: Boolean(ctx.extra?.["bypassCwdCheck"]),
+                kind: "directory",
+              })
+              return yield* Effect.fail(new Error(`Directory ${filepath} was redirected while waiting for permission.`))
+            }
+            const items = yield* list(canonicalPath)
+            const limit = params.limit ?? DEFAULT_READ_LIMIT
+            const offset = params.offset || 1
+            const start = offset - 1
+            const sliced = items.slice(start, start + limit)
+            const truncated = start + sliced.length < items.length
 
-        return {
-          title,
-          output: [
-            `<path>${filepath}</path>`,
-            `<type>directory</type>`,
-            `<entries>`,
-            sliced.join("\n"),
-            truncated
-              ? `\n(Showing ${sliced.length} of ${items.length} entries. Use 'offset' parameter to read beyond entry ${offset + sliced.length})`
-              : `\n(${items.length} entries)`,
-            `</entries>`,
-          ].join("\n"),
-          metadata: {
-            preview: sliced.slice(0, 20).join("\n"),
-            truncated,
-            loaded: [] as string[],
-            display: {
-              type: "directory" as const,
-              path: filepath,
-              entries: sliced,
-              offset,
-              totalEntries: items.length,
-              truncated,
-            },
-          },
-        }
-      }
-
-      const loaded = yield* instruction.resolve(ctx.messages, filepath, ctx.messageID)
-      const sample = yield* readSample(filepath, Number(stat.size), SAMPLE_BYTES)
-
-      const mime = sniffAttachmentMime(sample, FSUtil.mimeType(filepath))
-      const isImage = SUPPORTED_IMAGE_MIMES.has(mime)
-
-      if (isImage || isPdfAttachment(mime)) {
-        const bytes = yield* fs.readFile(filepath)
-        const msg = isPdfAttachment(mime) ? "PDF read successfully" : "Image read successfully"
-        return {
-          title,
-          output: msg,
-          metadata: {
-            preview: msg,
-            truncated: false,
-            loaded: loaded.map((item) => item.filepath),
-          },
-          attachments: [
-            {
-              type: "file" as const,
-              mime,
-              url: `data:${mime};base64,${Buffer.from(bytes).toString("base64")}`,
-            },
-          ],
-        }
-      }
-
-      if (isBinaryFile(filepath, sample)) {
-        return yield* Effect.fail(new Error(`Cannot read binary file: ${filepath}`))
-      }
-
-      const file = yield* lines(filepath, { limit: params.limit ?? DEFAULT_READ_LIMIT, offset: params.offset || 1 })
-      if (file.count < file.offset && !(file.count === 0 && file.offset === 1)) {
-        return yield* Effect.fail(
-          new Error(`Offset ${file.offset} is out of range for this file (${file.count} lines)`),
+            return {
+              title,
+              output: [
+                `<path>${filepath}</path>`,
+                `<type>directory</type>`,
+                `<entries>`,
+                sliced.join("\n"),
+                truncated
+                  ? `\n(Showing ${sliced.length} of ${items.length} entries. Use 'offset' parameter to read beyond entry ${offset + sliced.length})`
+                  : `\n(${items.length} entries)`,
+                `</entries>`,
+              ].join("\n"),
+              metadata: {
+                preview: sliced.slice(0, 20).join("\n"),
+                truncated,
+                loaded: [] as string[],
+                display: {
+                  type: "directory" as const,
+                  path: filepath,
+                  entries: sliced,
+                  offset,
+                  totalEntries: items.length,
+                  truncated,
+                },
+              },
+            }
+          }),
         )
       }
 
-      let output = [`<path>${filepath}</path>`, `<type>file</type>`, "<content>\n"].join("\n")
-      output += file.raw.map((line, i) => `${i + file.offset}: ${line}`).join("\n")
+      return yield* mutations.withLock(
+        canonicalPath,
+        Effect.gen(function* () {
+          const checked = yield* mutations.canonical(filepath)
+          if (checked !== canonicalPath) {
+            yield* assertExternalDirectoryEffect(ctx, checked, {
+              bypass: Boolean(ctx.extra?.["bypassCwdCheck"]),
+            })
+            return yield* Effect.fail(new Error(`File ${filepath} was redirected while waiting for permission.`))
+          }
+          const loaded = yield* instruction.resolve(ctx.messages, canonicalPath, ctx.messageID)
+          const file = yield* readFile(canonicalPath, {
+            limit: params.limit ?? DEFAULT_READ_LIMIT,
+            offset: params.offset || 1,
+          })
+          if (file.type === "media") {
+            const msg = isPdfAttachment(file.mime) ? "PDF read successfully" : "Image read successfully"
+            if (ctx.receipt) yield* ctx.receipt.settle({ canonicalPath, digest: file.digest })
+            return {
+              title,
+              output: msg,
+              metadata: {
+                preview: msg,
+                truncated: false,
+                loaded: loaded.map((item) => item.filepath),
+              },
+              attachments: [
+                {
+                  type: "file" as const,
+                  mime: file.mime,
+                  url: `data:${file.mime};base64,${file.content.toString("base64")}`,
+                },
+              ],
+            }
+          }
+          if (file.count < file.offset && !(file.count === 0 && file.offset === 1)) {
+            return yield* Effect.fail(
+              new Error(`Offset ${file.offset} is out of range for this file (${file.count} lines)`),
+            )
+          }
 
-      const last = file.offset + file.raw.length - 1
-      const next = last + 1
-      const truncated = file.more || file.cut
-      if (file.cut) {
-        output += `\n\n(Output capped at ${MAX_BYTES_LABEL}. Showing lines ${file.offset}-${last}. Use offset=${next} to continue.)`
-      } else if (file.more) {
-        output += `\n\n(Showing lines ${file.offset}-${last} of ${file.count}. Use offset=${next} to continue.)`
-      } else {
-        output += `\n\n(End of file - total ${file.count} lines)`
-      }
-      output += "\n</content>"
+          let output = [`<path>${filepath}</path>`, `<type>file</type>`, "<content>\n"].join("\n")
+          output += file.raw.map((line, i) => `${i + file.offset}: ${line}`).join("\n")
 
-      yield* warm(filepath)
+          const last = file.offset + file.raw.length - 1
+          const next = last + 1
+          const truncated = file.more || file.cut
+          if (file.cut) {
+            output += `\n\n(Output capped at ${MAX_BYTES_LABEL}. Showing lines ${file.offset}-${last}. Use offset=${next} to continue.)`
+          } else if (file.more) {
+            output += `\n\n(Showing lines ${file.offset}-${last} of ${file.count}. Use offset=${next} to continue.)`
+          } else {
+            output += `\n\n(End of file - total ${file.count} lines)`
+          }
+          output += "\n</content>"
 
-      if (loaded.length > 0) {
-        output += `\n\n<system-reminder>\n${loaded.map((item) => item.content).join("\n\n")}\n</system-reminder>`
-      }
+          yield* warm(canonicalPath)
 
-      return {
-        title,
-        output,
-        metadata: {
-          preview: file.raw.slice(0, 20).join("\n"),
-          truncated,
-          loaded: loaded.map((item) => item.filepath),
-          display: {
-            type: "file" as const,
-            path: filepath,
-            text: file.raw.join("\n"),
-            lineStart: file.offset,
-            lineEnd: last,
-            totalLines: file.count,
-            truncated,
-          },
-        },
-      }
+          if (loaded.length > 0) {
+            output += `\n\n<system-reminder>\n${loaded.map((item) => item.content).join("\n\n")}\n</system-reminder>`
+          }
+
+          if (ctx.receipt) yield* ctx.receipt.settle({ canonicalPath, digest: file.digest })
+          return {
+            title,
+            output,
+            metadata: {
+              preview: file.raw.slice(0, 20).join("\n"),
+              truncated,
+              loaded: loaded.map((item) => item.filepath),
+              display: {
+                type: "file" as const,
+                path: filepath,
+                text: file.raw.join("\n"),
+                lineStart: file.offset,
+                lineEnd: last,
+                totalLines: file.count,
+                truncated,
+              },
+            },
+          }
+        }),
+      )
     })
 
     return {

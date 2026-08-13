@@ -12,6 +12,7 @@ import { ApplicationTools } from "./application-tools"
 import { definition, permission, settle, validateName, type AnyTool, type RegistrationError } from "./tool"
 import { Tools } from "./tools"
 import { makeLocationNode } from "../effect/app-node"
+import type { Receipt } from "./trusted-receipt"
 
 export type ExecuteInput = {
   readonly sessionID: SessionSchema.ID
@@ -35,6 +36,10 @@ export interface Settlement {
   readonly result: ToolResultValue
   readonly output?: ToolOutput
   readonly outputPaths?: ReadonlyArray<string>
+  readonly receipt?: Receipt
+  readonly retains?: ReadonlyArray<() => Effect.Effect<void>>
+  readonly discards?: ReadonlyArray<() => Effect.Effect<void>>
+  readonly releases?: ReadonlyArray<() => Effect.Effect<void>>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/ToolRegistry") {}
@@ -59,26 +64,70 @@ const registryLayer = Layer.effect(
         }
       if (advertised && registration.identity !== advertised)
         return { result: { type: "error" as const, value: `Stale tool call: ${input.call.name}` } }
-      const pending = yield* settle(registration.tool, input.call, {
-        sessionID: input.sessionID,
-        agent: input.agent,
-        assistantMessageID: input.assistantMessageID,
-        toolCallID: input.call.id,
-      }).pipe(
-        Effect.map((output) => ({ output })),
-        Effect.catchTag("LLM.ToolFailure", (failure) =>
-          Effect.succeed({ result: { type: "error" as const, value: failure.message } }),
-        ),
+      const pending = yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const pending = yield* restore(
+            settle(registration.tool, input.call, {
+              sessionID: input.sessionID,
+              agent: input.agent,
+              assistantMessageID: input.assistantMessageID,
+              toolCallID: input.call.id,
+            }).pipe(
+              Effect.map((output) => ({ output })),
+              Effect.catchTag("LLM.ToolFailure", (failure) =>
+                Effect.succeed({ result: { type: "error" as const, value: failure.message } }),
+              ),
+            ),
+          )
+          if ("result" in pending) return pending
+          const managed = pending.output.managedOutput
+          const release = pending.output.release
+          const bounded = yield* restore(
+            resources.bound({
+              sessionID: input.sessionID,
+              toolCallID: input.call.id,
+              output: pending.output.output,
+              ...(managed ? { managedOutput: managed } : {}),
+            }),
+          ).pipe(
+            Effect.onError(() =>
+              Effect.all([managed?.discard?.() ?? Effect.void, release?.() ?? Effect.void], { discard: true }),
+            ),
+          )
+          return { pending, bounded }
+        }),
       )
       if ("result" in pending) return pending
-      const output = pending.output
-      const bounded = yield* resources.bound({ sessionID: input.sessionID, toolCallID: input.call.id, output })
-      const result = ToolOutput.toResultValue(bounded.output)
-      if (result.type === "error")
-        return bounded.outputPaths.length > 0 ? { result, outputPaths: bounded.outputPaths } : { result }
+      const bounded = pending.bounded
+      const result = yield* Effect.sync(() => ToolOutput.toResultValue(bounded.output)).pipe(
+        Effect.onError(() =>
+          Effect.all([bounded.discard?.() ?? Effect.void, pending.pending.output.release?.() ?? Effect.void], {
+            discard: true,
+          }),
+        ),
+      )
+      if (result.type === "error") {
+        yield* Effect.all([bounded.discard?.() ?? Effect.void, pending.pending.output.release?.() ?? Effect.void], {
+          discard: true,
+        })
+        return { result }
+      }
       return bounded.outputPaths.length > 0
-        ? { result, output: bounded.output, outputPaths: bounded.outputPaths }
-        : { result, output: bounded.output }
+        ? {
+            result,
+            output: bounded.output,
+            outputPaths: bounded.outputPaths,
+            ...(pending.pending.output.receipt ? { receipt: pending.pending.output.receipt } : {}),
+            ...(bounded.retain ? { retains: [bounded.retain] } : {}),
+            ...(bounded.discard ? { discards: [bounded.discard] } : {}),
+            ...(pending.pending.output.release ? { releases: [pending.pending.output.release] } : {}),
+          }
+        : {
+            result,
+            output: bounded.output,
+            ...(pending.pending.output.receipt ? { receipt: pending.pending.output.receipt } : {}),
+            ...(pending.pending.output.release ? { releases: [pending.pending.output.release] } : {}),
+          }
     })
 
     return Service.of({
